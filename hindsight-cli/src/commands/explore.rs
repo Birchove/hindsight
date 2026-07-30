@@ -208,16 +208,6 @@ impl App {
         Ok(())
     }
 
-    fn toggle_auto_refresh(&mut self) {
-        self.auto_refresh_enabled = !self.auto_refresh_enabled;
-        if self.auto_refresh_enabled {
-            self.status_message = "Auto-refresh enabled (5s)".to_string();
-            self.last_refresh = Instant::now();
-        } else {
-            self.status_message = "Auto-refresh disabled".to_string();
-        }
-    }
-
     fn should_refresh(&self) -> bool {
         self.auto_refresh_enabled && self.last_refresh.elapsed() >= self.refresh_interval
     }
@@ -356,6 +346,7 @@ impl App {
                             tags: None,
                             tags_match: TagsMatch::Any,
                             tag_groups: None,
+                            apply_all_directives: false,
                             fact_types: None,
                             exclude_mental_models: false,
                             exclude_mental_model_ids: None,

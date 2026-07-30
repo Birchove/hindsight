@@ -382,6 +382,7 @@ export class ControlPlaneClient {
     include_tool_calls?: boolean;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    apply_all_directives?: boolean;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
     exclude_mental_model_ids?: string[];
@@ -616,24 +617,23 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Regenerate entity observations
-   */
-  async regenerateEntityObservations(entityId: string, bankId: string) {
-    return this.fetchApi(
-      `/api/entities/${encodeURIComponent(entityId)}/regenerate?bank_id=${encodeURIComponent(bankId)}`,
-      {
-        method: "POST",
-      }
-    );
-  }
-
-  /**
    * List documents
    */
-  async listDocuments(params: { bank_id: string; q?: string; limit?: number; offset?: number }) {
+  async listDocuments(params: {
+    bank_id: string;
+    q?: string;
+    tags?: string[];
+    tags_match?: TagsMatch;
+    limit?: number;
+    offset?: number;
+  }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.q) queryParams.append("q", params.q);
+    for (const tag of params.tags ?? []) queryParams.append("tags", tag);
+    if (params.tags?.length && params.tags_match) {
+      queryParams.append("tags_match", params.tags_match);
+    }
     if (params.limit) queryParams.append("limit", params.limit.toString());
     if (params.offset) queryParams.append("offset", params.offset.toString());
     return this.fetchApi(`/api/documents?${queryParams}`);
@@ -929,16 +929,6 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Set bank mission
-   */
-  async setBankMission(bankId: string, mission: string) {
-    return this.fetchApi(bankApi(bankId), {
-      method: "PATCH",
-      body: JSON.stringify({ mission }),
-    });
-  }
-
-  /**
    * List directives for a bank
    */
   async listDirectives(bankId: string, tags?: string[], tagsMatch?: string) {
@@ -1086,27 +1076,6 @@ export class ControlPlaneClient {
     }>(bankApi(bankId, `/operations/${encodeURIComponent(operationId)}${qs}`));
   }
 
-  /**
-   * Update bank profile
-   */
-  async updateBankProfile(
-    bankId: string,
-    profile: {
-      name?: string;
-      disposition?: {
-        skepticism: number;
-        literalism: number;
-        empathy: number;
-      };
-      mission?: string;
-    }
-  ) {
-    return this.fetchApi(`/api/profile/${encodeURIComponent(bankId)}`, {
-      method: "PUT",
-      body: JSON.stringify(profile),
-    });
-  }
-
   // ============= OBSERVATIONS (auto-consolidated, read-only) =============
 
   /**
@@ -1146,35 +1115,6 @@ export class ControlPlaneClient {
         updated_at: string;
       }>;
     }>(bankApi(bankId, `/observations${query ? `?${query}` : ""}`));
-  }
-
-  /**
-   * Get an observation with source memories
-   */
-  async getObservation(bankId: string, observationId: string) {
-    return this.fetchApi<{
-      id: string;
-      bank_id: string;
-      text: string;
-      proof_count: number;
-      history: Array<{
-        previous_text: string;
-        changed_at: string;
-        reason: string;
-      }>;
-      tags: string[];
-      source_memory_ids: string[];
-      source_memories: Array<{
-        id: string;
-        text: string;
-        type: string;
-        context?: string;
-        occurred_start?: string;
-        mentioned_at?: string;
-      }>;
-      created_at: string;
-      updated_at: string;
-    }>(bankApi(bankId, `/observations/${encodeURIComponent(observationId)}`));
   }
 
   /**

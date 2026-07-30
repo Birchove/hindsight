@@ -314,6 +314,7 @@ ENV_RETAIN_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_RETAIN_LLM_INITIAL_BACKOFF"
 ENV_RETAIN_LLM_MAX_BACKOFF = "HINDSIGHT_API_RETAIN_LLM_MAX_BACKOFF"
 ENV_RETAIN_LLM_TIMEOUT = "HINDSIGHT_API_RETAIN_LLM_TIMEOUT"
 ENV_RETAIN_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_RETAIN_LLM_LITELLMROUTER_CONFIG"
+ENV_RETAIN_LLM_REASONING_EFFORT = "HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT"
 
 # Fireworks AI batch inference. Fireworks' batch API is a proprietary
 # account-scoped dataset/job REST API on a control-plane host, distinct from the
@@ -336,6 +337,7 @@ ENV_REFLECT_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_REFLECT_LLM_INITIAL_BACKOFF"
 ENV_REFLECT_LLM_MAX_BACKOFF = "HINDSIGHT_API_REFLECT_LLM_MAX_BACKOFF"
 ENV_REFLECT_LLM_TIMEOUT = "HINDSIGHT_API_REFLECT_LLM_TIMEOUT"
 ENV_REFLECT_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_REFLECT_LLM_LITELLMROUTER_CONFIG"
+ENV_REFLECT_LLM_REASONING_EFFORT = "HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT"
 
 ENV_CONSOLIDATION_LLM_PROVIDER = "HINDSIGHT_API_CONSOLIDATION_LLM_PROVIDER"
 ENV_CONSOLIDATION_LLM_API_KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY"
@@ -347,6 +349,7 @@ ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_INITIAL
 ENV_CONSOLIDATION_LLM_MAX_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_BACKOFF"
 ENV_CONSOLIDATION_LLM_TIMEOUT = "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT"
 ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG"
+ENV_CONSOLIDATION_LLM_REASONING_EFFORT = "HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT"
 
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
@@ -675,19 +678,61 @@ ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
 ENV_OPERATION_RETENTION_DAYS = "HINDSIGHT_API_OPERATION_RETENTION_DAYS"
 ENV_OPERATION_CLEANUP_BATCH_SIZE = "HINDSIGHT_API_OPERATION_CLEANUP_BATCH_SIZE"
 
-# Per-operation-type slot reservations. Each entry maps an operation_type
-# (as stored in async_operations.operation_type) to its env var and default.
-# Adding a new operation type here is the ONLY change needed to make it
-# reservable via env var — config fields, from_env(), and the
-# worker_slot_reservations property all derive from this dict.
-WORKER_SLOT_RESERVATION_TYPES: dict[str, tuple[str, int]] = {
-    "consolidation": ("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS", 2),
-    "retain": ("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS", 0),
-    "file_convert_retain": ("HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS", 0),
-    "refresh_mental_model": ("HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_MAX_SLOTS", 0),
-    "graph_maintenance": ("HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_MAX_SLOTS", 0),
-    "import_documents": ("HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_MAX_SLOTS", 0),
+
+# Per-operation-type worker slot reservations: op_type -> default reserved count.
+# Each entry reserves a guaranteed *minimum* number of slots (a floor) for that
+# operation type within the global WORKER_MAX_SLOTS pool, so a saturated pool can't
+# starve it. Remaining capacity (WORKER_MAX_SLOTS - sum of reservations) is a shared
+# pool usable by any type, so a reservation does NOT cap the type — it may overflow
+# the shared pool. Adding a type here is the only change needed to make it reservable.
+#
+# op_type matches the value stored in async_operations.operation_type; the env var
+# names are derived from it (see _parse_worker_slot_reservations).
+WORKER_SLOT_TYPE_DEFAULTS: dict[str, int] = {
+    "consolidation": 2,
+    "retain": 0,
+    "file_convert_retain": 0,
+    "refresh_mental_model": 0,
+    "graph_maintenance": 0,
+    "import_documents": 0,
 }
+
+
+def _parse_worker_slot_reservations() -> dict[str, int]:
+    """Parse per-type RESERVED_SLOTS (and the deprecated _MAX_SLOTS alias).
+
+    ``HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS`` is a deprecated alias for
+    ``..._RESERVED_SLOTS`` — despite its name it always set the reservation floor,
+    never a ceiling. It still works but logs a warning. Returns op_type -> reserved
+    floor for entries with a reservation > 0.
+    """
+    reservations: dict[str, int] = {}
+    for op_type, default in WORKER_SLOT_TYPE_DEFAULTS.items():
+        reserved_env = f"HINDSIGHT_API_WORKER_{op_type.upper()}_RESERVED_SLOTS"
+        legacy_env = f"HINDSIGHT_API_WORKER_{op_type.upper()}_MAX_SLOTS"
+        raw_reserved = os.getenv(reserved_env)
+        raw_legacy = os.getenv(legacy_env)
+        if raw_reserved is not None and raw_legacy is not None:
+            raise ValueError(
+                f"Both {reserved_env} and the deprecated {legacy_env} are set; "
+                f"they configure the same value. Keep only {reserved_env}."
+            )
+        if raw_legacy is not None:
+            logger.warning(
+                "%s is deprecated and will be removed in a future release. Despite its name it "
+                "reserves a *minimum* (floor), not a maximum. Rename it to %s.",
+                legacy_env,
+                reserved_env,
+            )
+        reserved_source = raw_reserved if raw_reserved is not None else raw_legacy
+        reserved = int(reserved_source) if reserved_source is not None else default
+        if reserved < 0:
+            raise ValueError(f"{reserved_env} must be >= 0, got {reserved}")
+        if reserved > 0:
+            reservations[op_type] = reserved
+    return reservations
+
+
 ENV_WORKER_CONSOLIDATION_BANK_PRIORITY = "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY"
 ENV_RETAIN_MAX_CONCURRENT = "HINDSIGHT_API_RETAIN_MAX_CONCURRENT"
 ENV_RETAIN_WALL_TIMEOUT = "HINDSIGHT_API_RETAIN_WALL_TIMEOUT"
@@ -1817,6 +1862,7 @@ class HindsightConfig:
     retain_llm_max_backoff: float | None
     retain_llm_timeout: float | None
     retain_llm_litellmrouter_config: dict | None
+    retain_llm_reasoning_effort: str | None
 
     # Fireworks AI batch inference (static, server-level)
     fireworks_account_id: str | None
@@ -1833,6 +1879,7 @@ class HindsightConfig:
     reflect_llm_max_backoff: float | None
     reflect_llm_timeout: float | None
     reflect_llm_litellmrouter_config: dict | None
+    reflect_llm_reasoning_effort: str | None
 
     consolidation_llm_provider: str | None
     consolidation_llm_api_key: str | None
@@ -1844,6 +1891,7 @@ class HindsightConfig:
     consolidation_llm_max_backoff: float | None
     consolidation_llm_timeout: float | None
     consolidation_llm_litellmrouter_config: dict | None
+    consolidation_llm_reasoning_effort: str | None
 
     # Embeddings
     embeddings_provider: str
@@ -2518,6 +2566,9 @@ class HindsightConfig:
         llm_provider = os.getenv(ENV_LLM_PROVIDER, DEFAULT_LLM_PROVIDER)
         llm_model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(llm_provider)
 
+        # Parse per-type worker slot reservations (floors) once.
+        worker_slot_reservations = _parse_worker_slot_reservations()
+
         config = cls(
             # Database
             database_backend=os.getenv(ENV_DATABASE_BACKEND, DEFAULT_DATABASE_BACKEND).lower(),
@@ -2636,6 +2687,7 @@ class HindsightConfig:
             else None,
             retain_llm_timeout=float(os.getenv(ENV_RETAIN_LLM_TIMEOUT)) if os.getenv(ENV_RETAIN_LLM_TIMEOUT) else None,
             retain_llm_litellmrouter_config=_parse_llm_router_config(ENV_RETAIN_LLM_LITELLMROUTER_CONFIG),
+            retain_llm_reasoning_effort=os.getenv(ENV_RETAIN_LLM_REASONING_EFFORT) or None,
             reflect_llm_provider=os.getenv(ENV_REFLECT_LLM_PROVIDER) or None,
             reflect_llm_api_key=os.getenv(ENV_REFLECT_LLM_API_KEY) or None,
             reflect_llm_model=os.getenv(ENV_REFLECT_LLM_MODEL)
@@ -2661,6 +2713,7 @@ class HindsightConfig:
             if os.getenv(ENV_REFLECT_LLM_TIMEOUT)
             else None,
             reflect_llm_litellmrouter_config=_parse_llm_router_config(ENV_REFLECT_LLM_LITELLMROUTER_CONFIG),
+            reflect_llm_reasoning_effort=os.getenv(ENV_REFLECT_LLM_REASONING_EFFORT) or None,
             consolidation_llm_provider=os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER) or None,
             consolidation_llm_api_key=os.getenv(ENV_CONSOLIDATION_LLM_API_KEY) or None,
             consolidation_llm_model=os.getenv(ENV_CONSOLIDATION_LLM_MODEL)
@@ -2686,6 +2739,7 @@ class HindsightConfig:
             if os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT)
             else None,
             consolidation_llm_litellmrouter_config=_parse_llm_router_config(ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG),
+            consolidation_llm_reasoning_effort=os.getenv(ENV_CONSOLIDATION_LLM_REASONING_EFFORT) or None,
             # Multi-LLM chains (indexed members + routing strategy)
             llm_members=_parse_llm_members(""),
             llm_strategy=_parse_llm_strategy(os.getenv(ENV_LLM_STRATEGY)),
@@ -3206,11 +3260,7 @@ class HindsightConfig:
             ),
             worker_http_port=int(os.getenv(ENV_WORKER_HTTP_PORT, str(DEFAULT_WORKER_HTTP_PORT))),
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
-            worker_slot_reservations={
-                op_type: int(os.getenv(env_var, str(default)))
-                for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()
-                if int(os.getenv(env_var, str(default))) > 0
-            },
+            worker_slot_reservations=worker_slot_reservations,
             worker_consolidation_bank_priority=_parse_bank_priority(
                 os.getenv(ENV_WORKER_CONSOLIDATION_BANK_PRIORITY, "")
             ),
