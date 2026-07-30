@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>07 · 四路检索 — Hindsight 源码精读</title>
+  <link rel="stylesheet" href="assets/css/course.css">
+  <link rel="stylesheet" href="assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="目录">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">第三部分 · 检索 Recall</p>
+      <h1>07 · 四路检索</h1>
+      <p class="lead">上一章看了流水线骨架。这一章把四路逐个拆开:<strong>语义</strong>怎么走向量、<strong>BM25</strong> 怎么做全文、<strong>图</strong>怎么从种子扩展、<strong>时间</strong>怎么"入口 + 扩散"。每一路都有值得记住的工程细节——HNSW 过取样、图扩展的"加总打分"、时间检索"按相似度而非按时间排序"的反直觉选择。</p>
+
+      <div class="keypoints">
+        <h3>本章要点</h3>
+        <ul>
+          <li>四路都读 <code>memory_units</code>,都按 <code>bank_id</code> + fact_type + tags 过滤,都返回 <code>list[RetrievalResult]</code>。</li>
+          <li><strong>语义</strong>:每个 fact_type 一个 UNION ALL 分支命中偏索引;HNSW 是近似的,所以<strong>过取 5× 再在 Python 里裁</strong>。</li>
+          <li><strong>BM25</strong>:默认原生 tsvector + <code>ts_rank_cd</code>;查询无词元就整路不跑。</li>
+          <li><strong>图</strong>:<strong>不是多跳 BFS</strong>,而是"从语义种子出发、一条 SQL、经三种链信号扩展",打分<strong>跨信号加总</strong>奖励"汇聚的证据"。</li>
+          <li><strong>时间</strong>:先选"入口点"(按相似度、覆盖整个时间窗),再沿时间/因果边<strong>扩散激活</strong>(这步才像 BFS)。</li>
+        </ul>
+      </div>
+
+      <h2 id="semantic">1. 语义路:向量相似度</h2>
+      <p class="src-ref"><strong>定位</strong>:SQL 由 <code>engine/sql/postgresql.py</code> 的 <code>build_semantic_arm</code> 构造;执行在 <code>search/retrieval.py</code> 的 <code>retrieve_semantic_bm25_combined</code>。</p>
+      <p>相似度用 pgvector 的余弦距离算子 <code>&lt;=&gt;</code>,表示成 <code>1 - 距离</code>:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/sql/postgresql.py · build_semantic_arm(节选)</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">(SELECT {cols},
+        1 - (embedding &lt;=&gt; $q::vector) AS similarity,
+        NULL::float AS bm25_score,
+        'semantic' AS source
+ FROM memory_units
+ WHERE bank_id = $b
+   AND fact_type = 'world'              -- 每个 fact_type 一个分支
+   AND embedding IS NOT NULL
+   AND (1 - (embedding &lt;=&gt; $q::vector)) &gt;= {min_similarity}   -- 默认 0.3
+ ORDER BY embedding &lt;=&gt; $q::vector
+ LIMIT {fetch_limit})</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 两个关键设计</p>
+        <p><strong>(1) 每 fact_type 一个 UNION ALL 分支</strong>:而不是一个大查询用窗口函数 <code>ROW_NUMBER() PARTITION BY fact_type</code>。为什么?因为带上 <code>fact_type = '...'</code> 过滤,规划器才会走<strong>每 fact_type 的偏 HNSW 索引</strong>(第 02 章那批 <code>idx_mu_emb_*</code>);窗口函数那种写法曾逼出全表顺序扫描。<br>
+        <strong>(2) HNSW 过取样</strong>:HNSW 是<strong>近似</strong>最近邻,直接 <code>LIMIT k</code> 可能漏掉真正的好结果。所以每个分支取 <code>hnsw_fetch = max(limit*5, 100)</code>,<strong>过取 5 倍,再在 Python 里裁回 limit</strong>。连接初始化时还设了 <code>ef_search=200</code> 提高召回。</p>
+      </div>
+      <div class="callout tip">
+        <p class="callout-title">✅ 顺带:语义结果被图路复用</p>
+        <p>如果语义门槛 ≤ <code>graph_seed_min_similarity</code>,那么排好序的语义行会<strong>直接当作图检索的入口种子</strong>(上限 20 个),省掉图路再做一次 ANN 查询。这是第 06 章"图依赖语义"的具体体现。</p>
+      </div>
+
+      <h2 id="bm25">2. 关键词路:BM25 / 全文</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>build_bm25_arm</code>(同文件)。</p>
+      <p>默认后端是<strong>原生 tsvector</strong>,用 <code>ts_rank_cd</code> 排序、<code>@@</code> 做匹配门:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/sql/postgresql.py · build_bm25_arm 原生分支(节选)</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">(SELECT {cols},
+        NULL::float AS similarity,
+        ts_rank_cd(search_vector, to_tsquery('english', $text)) AS bm25_score,
+        'bm25' AS source
+ FROM memory_units
+ WHERE bank_id = $b AND fact_type = 'world'
+   AND search_vector @@ to_tsquery('english', $text)   -- 匹配门
+ ORDER BY bm25_score DESC
+ LIMIT {limit})</code></pre>
+      </div>
+      <p>查询词由 <code>prepare_bm25_text</code> 用 <code>|</code>(OR)连接。要点:</p>
+      <ul>
+        <li><strong>无词元则整路不跑</strong>:<code>tokenize_query</code> 去标点、按空白切;纯符号查询切不出词,就<strong>根本不生成 BM25 分支</strong>(还会改变绑定参数的布局)。</li>
+        <li><strong>后端可换</strong>:除原生 tsvector 外,还支持 <code>pg_search</code>(ParadeDB)、<code>pgroonga</code>、<code>vchord</code>、<code>pg_textsearch</code>。<code>_pg_search.py</code> 只是 ParadeDB 的索引 DDL 助手,不在查询路径上。</li>
+        <li><strong>Oracle 兜底</strong>:若 <code>CONTAINS</code> 因索引未同步报错,整条查询<strong>重建成只走语义</strong>。</li>
+      </ul>
+
+      <h2 id="graph">3. 图路:链扩展</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>search/link_expansion_retrieval.py</code> 的 <code>LinkExpansionRetriever</code>(默认图检索器)。</p>
+      <div class="callout concept">
+        <p class="callout-title">📖 它不是多跳 BFS</p>
+        <p>名字里有"expansion",容易想象成"层层外扩的图遍历"。实际上它是<strong>有界的、一次 SQL 往返的扩展</strong>:从语义种子出发,通过 Retain 时就建好的三种链信号找邻居。这三种信号在写入时就被<strong>限定好了规模</strong>,所以查询时不需要深遍历。</p>
+      </div>
+      <p>三种链信号,各有一个 CTE,最后 <code>UNION ALL</code> 成<strong>一条查询、一个连接</strong>:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>信号</th><th>来源</th><th>分数</th></tr></thead>
+          <tbody>
+            <tr><td><strong>实体</strong></td><td>查询时自连接 <code>unit_entities</code>(共享实体)</td><td><code>COUNT(DISTINCT entity_id)</code>,每实体带 LATERAL 上限 200</td></tr>
+            <tr><td><strong>语义</strong></td><td>Retain 时预算好的 kNN 图(<code>memory_links</code> 里 <code>link_type='semantic'</code>),<strong>双向</strong>查(图不对称)</td><td><code>MAX(weight)</code></td></tr>
+            <tr><td><strong>因果</strong></td><td><code>causes/caused_by/enables/prevents</code></td><td><code>weight</code>(作为最高质量信号加权)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/db/ops_postgresql.py · 实体扩展 CTE(节选)</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">entity_expanded AS (
+  SELECT mu.id, ...,
+         COUNT(DISTINCT se.entity_id)::float AS score,   -- 共享实体数
+         'entity'::text AS source
+  FROM seed_entities se
+  CROSS JOIN LATERAL (
+      SELECT ue_target.unit_id
+      FROM unit_entities ue_target
+      WHERE ue_target.entity_id = se.entity_id
+        AND ue_target.unit_id != ALL($1::uuid[])          -- 排除种子自身
+        AND EXISTS (SELECT 1 FROM memory_units mu_target
+                    WHERE mu_target.id = ue_target.unit_id
+                      AND mu_target.fact_type = $2)        -- 先过滤再限流
+      ORDER BY ue_target.unit_id DESC
+      LIMIT 200                                            -- 每实体上限
+  ) t
+  JOIN memory_units mu ON mu.id = t.unit_id
+  GROUP BY mu.id
+  ORDER BY score DESC
+  LIMIT $3
+)</code></pre>
+      </div>
+      <h3 id="graph-score">加总打分:奖励"汇聚的证据"</h3>
+      <p>一条事实可能同时被多个信号命中。合并时<strong>跨信号相加</strong>(总分落在 [0,3]):</p>
+      <ul>
+        <li>实体 → <code>tanh(共享数 × 0.5)</code>(共享 1 个得 0.46,2 个得 0.76,逐渐饱和);</li>
+        <li>语义 → 最大链权重;</li>
+        <li>因果 → 最大链权重。</li>
+      </ul>
+      <div class="callout why">
+        <p class="callout-title">💡 为什么加总而不是取最大?</p>
+        <p>如果一条事实<strong>既</strong>和查询共享实体、<strong>又</strong>有语义边、<strong>还</strong>有因果边,那它相关的证据是"汇聚"的,应该比只命中一路的更靠前。加总让这种<strong>多重证据</strong>累加起来。最终这个加总分存进 <code>RetrievalResult.activation</code>——注意它必须是<strong>加总后的</strong>分,而不是单信号分,否则跨 fact_type 的排序会和图内排序打架。</p>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ 超时降级与 observation 的特殊路径</p>
+        <p>整条图查询包在 <code>asyncio.wait_for(timeout=10s)</code> 里;<strong>超时就降级为只用语义+因果</strong>(丢掉最贵的实体自连接)。另外,observation 没有直接的实体链,走单独的 <code>_expand_observations</code>:经 <code>source_memory_ids → world 事实 → 实体 → 其他 world 事实 → 它们的 observation</code> 绕行。</p>
+      </div>
+
+      <h2 id="temporal">4. 时间路:入口点 + 扩散激活</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>search/retrieval.py</code> 的 <code>retrieve_temporal_combined</code>。<strong>仅当查询分析抽到时间约束时才跑。</strong></p>
+      <p>分两阶段:</p>
+
+      <h3 id="entry">阶段一:选入口点(按相似度,不按时间!)</h3>
+      <p>每个 fact_type 一个"相似度排序 + 时间窗过滤"的分支,先捞一个池子(<code>_TEMPORAL_POOL_SIZE = 60</code>),再收窄到每 fact_type <code>_TEMPORAL_ENTRY_POINTS = 10</code> 个,且这 10 个要<strong>覆盖整个时间窗</strong>(按 8 个时间桶 round-robin 选,避免都挤在一头):</p>
+      <div class="code-block">
+        <div class="code-header"><span>search/retrieval.py · 时间入口分支(节选)</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">(SELECT {pool_cols}, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
+ FROM memory_units
+ WHERE bank_id = $2 AND fact_type = 'world' AND embedding IS NOT NULL
+   AND (   -- 时间窗匹配:occurred 区间或 mentioned_at 落在 [start,end]
+        (occurred_start IS NOT NULL AND occurred_end IS NOT NULL
+         AND occurred_start &lt;= $4 AND occurred_end &gt;= $3)
+     OR (mentioned_at IS NOT NULL AND mentioned_at BETWEEN $3 AND $4)
+     OR (occurred_start IS NOT NULL AND occurred_start BETWEEN $3 AND $4)
+     OR (occurred_end   IS NOT NULL AND occurred_end   BETWEEN $3 AND $4))
+   AND (1 - (embedding &lt;=&gt; $1::vector)) &gt;= $5      -- 默认 0.1
+ ORDER BY embedding &lt;=&gt; $1::vector
+ LIMIT 60)</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 为什么"按相似度选",而不是"按时间远近选"?</p>
+        <p>早期版本按日期排序选入口,结果<strong>把结果偏向时间窗的末端</strong>;而且在日期密集/均匀的 bank 上,会退化成"近乎随机抽样 + 一次全表扫描 + 溢出磁盘的排序"——在一个 66 万行的 bank 上要 30 多秒。改成<strong>按相似度排序</strong>(走 ANN 索引)+ 用桶保证时间覆盖,又快又均衡。</p>
+      </div>
+
+      <h3 id="spread">阶段二:扩散激活(这步才像 BFS)</h3>
+      <p>从入口点出发,沿<strong>时间/因果边</strong>做有界的多跳扩散(frontier + visited + 预算,<code>max_iterations=5</code>):</p>
+      <div class="code-block">
+        <div class="code-header"><span>search/retrieval.py · 一跳扩散(节选)</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">SELECT src.from_unit_id, mu.id, ..., l.weight, l.link_type,
+       1 - (mu.embedding &lt;=&gt; $1::vector) AS similarity
+FROM unnest($2::uuid[]) AS src(from_unit_id)
+CROSS JOIN LATERAL (
+    SELECT ml.to_unit_id, ml.weight, ml.link_type
+    FROM memory_links ml
+    WHERE ml.from_unit_id = src.from_unit_id
+      AND ml.link_type IN ('temporal','causes','caused_by','enables','prevents')
+      AND ml.weight &gt;= 0.1
+    ORDER BY ml.weight DESC
+    LIMIT $5
+) l
+JOIN memory_units mu ON mu.id = l.to_unit_id
+WHERE mu.bank_id = $6 AND mu.fact_type = $3 AND mu.embedding IS NOT NULL
+  AND (1 - (mu.embedding &lt;=&gt; $1::vector)) &gt;= $4</code></pre>
+      </div>
+      <p>每个邻居得到一个 <code>temporal_proximity</code>(时间窗中点为 1.0、边缘为 0.0)和一个<strong>传播分</strong> = 父分 × 边权 × 因果加成 × 0.7(因果加成:causes/caused_by 为 2.0,enables/prevents 为 1.5)。取 <code>max(接近度, 传播分)</code>;高于 0.2 的邻居重新进入 frontier。</p>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ Oracle 上扩散被跳过</p>
+        <p>扩散用到 <code>unnest</code> / LATERAL,Oracle 没有等价物,所以<strong>Oracle 上跳过扩散</strong>(但入口点仍返回)。时间结果为空时会被规范成 <code>None</code>(表示"没有时间路"),区别于 <code>[]</code>。</p>
+      </div>
+
+      <div class="summary">
+        <h2>小结</h2>
+        <ul>
+          <li><strong>语义</strong>:per-fact_type 分支命中偏索引;HNSW 过取 5× 再裁;门槛 0.3;结果可复用为图种子。</li>
+          <li><strong>BM25</strong>:原生 tsvector + <code>ts_rank_cd</code>;无词元不跑;后端可换;Oracle 兜底转纯语义。</li>
+          <li><strong>图</strong>:有界单次 SQL 扩展,三种链信号(实体/语义/因果)<strong>加总打分</strong>;超时降级;observation 绕行。</li>
+          <li><strong>时间</strong>:按相似度选入口点(桶覆盖全窗)+ 沿时间/因果边扩散激活;Oracle 跳过扩散。</li>
+        </ul>
+        <p>四路各交回一个排名列表。下一章看它们如何被<strong>融合</strong>(RRF)、<strong>重排</strong>(cross-encoder),最后按 token 预算裁剪成答案。</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="assets/js/mermaid.min.js"></script>
+  <script src="assets/js/highlight.min.js"></script>
+  <script src="assets/js/course.js"></script>
+</body>
+</html>

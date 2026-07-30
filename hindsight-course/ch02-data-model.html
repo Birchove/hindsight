@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>02 · 数据模型:记忆长什么样 — Hindsight 源码精读</title>
+  <link rel="stylesheet" href="assets/css/course.css">
+  <link rel="stylesheet" href="assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="目录">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">第一部分 · 认识系统</p>
+      <h1>02 · 数据模型:记忆长什么样</h1>
+      <p class="lead">后面所有章节都会反复写到同一批表。这一章把地基打好:有哪些表、它们怎么关联、"一条事实"在磁盘上到底长什么样、向量怎么存、多租户怎么隔离。读懂这章,后续所有 SQL 都不再陌生。</p>
+
+      <div class="keypoints">
+        <h3>本章要点</h3>
+        <ul>
+          <li>记忆的主体是 <strong><code>memory_units</code></strong> 表——一行 = 一条原子事实;它同时携带 embedding、BM25 搜索向量、时间字段和巩固记账字段。</li>
+          <li>图结构由 <code>entities</code> + <code>unit_entities</code>(事实↔实体)和 <code>memory_links</code>(事实↔事实的三种边)构成。</li>
+          <li><strong>observation 不是独立的表</strong>,而是 <code>memory_units</code> 里 <code>fact_type='observation'</code> 的行——别和 <code>mental_models</code> 表混淆(后者经历了多次改名)。</li>
+          <li>向量用 <strong>pgvector(384 维,HNSW 余弦)</strong>;HEAD 上是<strong>每 bank、每 fact_type 一个偏索引</strong>。</li>
+          <li>多租户 = <strong>每租户一个 schema + <code>search_path</code></strong>,运行时用 contextvar + <code>fq_table()</code> 全限定表名;bank 之间靠 <code>WHERE bank_id = …</code> 隔离。</li>
+        </ul>
+      </div>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ 先打预防针:models.py 不是全部真相</p>
+        <p>SQLAlchemy ORM(<code>models.py</code>)只定义了 7 张表和一部分列;<strong>运行时引擎实际执行的是手写 asyncpg SQL</strong>(<code>engine/db/ops_postgresql.py</code>,约 59KB),对着一个有 ~20 张表、更多列(search vector、tags、巩固记账)的真实 schema。<strong>权威来源是 Alembic migrations</strong>(约 89 个)加上这些手写 SQL。ORM 滞后于真实 schema(例如 <code>Bank</code> 还显示已被改名掉的 <code>background</code> 字段)。读 schema 时,以 migrations 和 <code>ops_postgresql.py</code> 为准。</p>
+      </div>
+
+      <h2 id="inventory">1. 表总览</h2>
+      <p>按职责分三组:</p>
+
+      <h3>① 核心记忆图</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>表</th><th>职责</th></tr></thead>
+          <tbody>
+            <tr><td><code>banks</code></td><td>每个记忆库一行:disposition 三特质、mission、per-bank 配置、用于索引命名的稳定 <code>internal_id</code></td></tr>
+            <tr><td><code>documents</code></td><td>来源文档;复合主键 <code>(id, bank_id)</code>;存 <code>original_text</code>、用于去重的 <code>content_hash</code>、retain 参数、tags</td></tr>
+            <tr><td><code>chunks</code></td><td>文档切块;<strong>确定性文本主键</strong>;带 <code>content_hash</code> 供 delta 用</td></tr>
+            <tr><td><code>memory_units</code></td><td><strong>原子事实本体</strong>。embedding、BM25 搜索向量、fact_type、时间字段、巩固/observation 记账全在这。<strong>中心表</strong></td></tr>
+            <tr><td><code>entities</code></td><td>归一后的实体;按 <code>(bank_id, LOWER(canonical_name))</code> 唯一</td></tr>
+            <tr><td><code>unit_entities</code></td><td>事实↔实体的连接表(复合主键,无载荷列)</td></tr>
+            <tr><td><code>entity_cooccurrences</code></td><td>实体共现计数的物化缓存(喂给归一打分)</td></tr>
+            <tr><td><code>memory_links</code></td><td>事实之间的有类型、带权、有向边(temporal/semantic/causal)</td></tr>
+            <tr><td><code>invalidated_memory_units</code></td><td>冷归档:被作废的事实<strong>移动</strong>到这里,使检索热路径永远看不到它们</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>② 巩固与反思层</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>表</th><th>职责</th></tr></thead>
+          <tbody>
+            <tr><td><code>mental_models</code></td><td><strong>改过两次名</strong>。HEAD 上存"被固化的 reflect 结果 / pinned / directive",子类型 <code>'directive'</code>、<code>'pinned'</code>。<strong>注意:巩固出的知识不在这里</strong>,而在 <code>memory_units</code> 的 <code>fact_type='observation'</code> 行</td></tr>
+            <tr><td><code>directives</code></td><td>硬规则(独立成表)</td></tr>
+            <tr><td><code>observation_history</code> / <code>mental_model_history</code></td><td>各自的编辑历史(从主表拆出)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>③ 运维 / 基础设施</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>表</th><th>职责</th></tr></thead>
+          <tbody>
+            <tr><td><code>async_operations</code></td><td>异步任务(retain/consolidation 等)的状态、worker、重试、payload</td></tr>
+            <tr><td><code>webhooks</code></td><td>每 bank 的 webhook 订阅</td></tr>
+            <tr><td><code>file_storage</code></td><td>零配置的 BYTEA/BLOB 文件存储</td></tr>
+            <tr><td><code>audit_log</code> / <code>llm_requests</code></td><td>审计与 LLM 调用日志</td></tr>
+            <tr><td><code>graph_maintenance_queue</code></td><td>延迟执行的图维护工作项</td></tr>
+            <tr><td><code>memory_units_bm25</code></td><td>BM25 评分用的物化视图(<code>to_tsvector</code> + 文档长度因子)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="er">2. 关系图与基数</h2>
+      <div class="diagram">
+        <div class="mermaid">
+erDiagram
+  banks ||--o{ documents : "bank_id"
+  banks ||--o{ mental_models : "bank_id"
+  documents ||--o{ chunks : "(id,bank_id) CASCADE"
+  documents ||--o{ memory_units : "(id,bank_id) CASCADE"
+  chunks ||--o{ memory_units : "chunk_id SET NULL"
+  memory_units }o--o{ entities : "unit_entities"
+  memory_units ||--o{ memory_links : "from/to"
+  memory_units ||--o{ memory_links : "to"
+  entities ||--o{ entity_cooccurrences : "配对"
+  memory_units }o--o{ memory_units : "source_memory_ids(observation)"
+        </div>
+        <div class="diagram-caption">图 2-1:核心表关系。注意 observation 到源事实是 <code>UUID[]</code> 数组(软引用),不是外键;bank 在 PG 上大多不以 FK 被引用,而是靠 <code>bank_id</code> 列逻辑隔离。</div>
+      </div>
+      <ul>
+        <li><strong>bank → documents / memory_units / entities</strong>:1∶N(每行都带 <code>bank_id</code>)。</li>
+        <li><strong>document → chunks</strong>:1∶N,复合外键 <code>(document_id, bank_id)</code>,<code>ON DELETE CASCADE</code>。</li>
+        <li><strong>chunk → memory_units</strong>:1∶N,但 <code>ON DELETE SET NULL</code>——删块<strong>孤立</strong>事实而非销毁。</li>
+        <li><strong>memory_unit ↔ entity</strong>:M∶N,经 <code>unit_entities</code>,复合主键,两边都 CASCADE。</li>
+        <li><strong>memory_unit ↔ memory_unit</strong>:M∶N 有向,经 <code>memory_links</code>,四列主键 <code>(from_unit_id, to_unit_id, link_type, entity_id)</code>——同一对可以有每种类型各一条边。</li>
+        <li><strong>observation → 源事实</strong>:<strong>不是外键</strong>,而是 <code>source_memory_ids UUID[]</code> 数组列,用数组运算查询。</li>
+      </ul>
+
+      <h2 id="mu">3. <code>memory_units</code>:一条事实的本体</h2>
+      <p>这是全系统最重要的表。把它的字段按职责分组:</p>
+      <div class="code-block">
+        <div class="code-header"><span>alembic/versions/5a366d414dce_initial_schema.py(节选,后续 migration 又加了许多列)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">op.create_table(
+    "memory_units",
+    sa.Column("id", postgresql.UUID(as_uuid=True),
+              server_default=sa.text("gen_random_uuid()"), nullable=False),
+    sa.Column("bank_id", sa.Text(), nullable=False),
+    sa.Column("document_id", sa.Text(), nullable=True),
+    sa.Column("text", sa.Text(), nullable=False),             # 事实正文
+    sa.Column("embedding", Vector(384), nullable=True),       # pgvector
+    sa.Column("context", sa.Text(), nullable=True),
+    sa.Column("event_date", postgresql.TIMESTAMP(timezone=True), nullable=False),
+    sa.Column("occurred_start", ...), sa.Column("occurred_end", ...),
+    sa.Column("mentioned_at", ...),
+    sa.Column("fact_type", sa.Text(), server_default="world", nullable=False),
+    ...
+)
+# fact_type 的 CHECK 约束在 HEAD 上是:
+#   fact_type IN ('world', 'experience', 'observation')</code></pre>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>分组</th><th>字段</th></tr></thead>
+          <tbody>
+            <tr><td>身份 / 租户</td><td><code>id</code>(UUID)、<code>bank_id</code>(隔离键,永不为空)</td></tr>
+            <tr><td>溯源</td><td><code>document_id</code>、<code>chunk_id</code>(删块时 SET NULL)</td></tr>
+            <tr><td>内容</td><td><code>text</code>(事实句,NOT NULL)、<code>context</code>、<code>metadata</code>(JSONB)、<code>tags</code>(VARCHAR[])、<code>search_vector</code>(生成的 BM25 表示)</td></tr>
+            <tr><td>语义</td><td><code>embedding</code>(vector(384))、<code>fact_type</code>(world/experience/observation)</td></tr>
+            <tr><td>时间(四个!)</td><td><code>event_date</code>(必填,兼容旧版)、<code>occurred_start/end</code>(发生的时间区间)、<code>mentioned_at</code>(被提到的时间)</td></tr>
+            <tr><td>生命周期</td><td><code>created_at/updated_at</code>、<code>access_count</code>、<code>edited_at</code>、<code>consolidated_at</code>(已被巩固消费)、<code>consolidation_failed_at</code></td></tr>
+            <tr><td>仅 observation 用</td><td><code>proof_count</code>(多少条证据支撑)、<code>source_memory_ids</code>(UUID[])、<code>history</code>(JSONB)、<code>observation_scopes</code>、<code>text_signals</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout concept">
+        <p class="callout-title">📖 为什么有四个时间字段?</p>
+        <p>因为"记忆"的时间语义本身就多维:一件事<strong>何时发生</strong>(<code>occurred_start/end</code>)、<strong>何时被提及</strong>(<code>mentioned_at</code>)、以及一个兜底的 <code>event_date</code>。时间检索(第 07 章)会同时在 <code>occurred_*</code> 和 <code>mentioned_at</code> 上做窗口匹配——"六月发生了什么"和"六月我们聊到过什么"是不同的问题。</p>
+      </div>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ <code>chunk_id</code> 是确定性的,不是 UUID</p>
+        <p><code>chunk_id = f"{bank_id}_{document_id}_{chunk_index}"</code>(<code>chunk_storage.py</code>)。插入是幂等 upsert——同一 <code>document_id</code> 重复提交会产生相同 <code>chunk_id</code>,<strong>覆盖是正确行为</strong>。这也解释了第 04 章为什么切块必须幂等:<code>chunk_index</code> 冲突会直接撞主键。</p>
+      </div>
+
+      <h2 id="graph-tables">4. <code>entities</code> / <code>unit_entities</code> / <code>memory_links</code></h2>
+      <div class="code-block">
+        <div class="code-header"><span>initial_schema.py · entities 唯一索引 + memory_links 约束(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># entities: 按 (bank, 小写规范名) 唯一 —— "Paris" 与 "paris" 同一实体
+op.execute("CREATE UNIQUE INDEX idx_entities_bank_lower_name "
+           "ON entities (bank_id, LOWER(canonical_name))")
+
+# memory_links: 类型与权重约束
+CheckConstraint(
+  "link_type IN ('temporal','semantic','entity','causes','caused_by','enables','prevents')")
+CheckConstraint("weight &gt;= 0.0 AND weight &lt;= 1.0")
+
+# 唯一性:可空的 entity_id 用 nil-UUID 顶替,才能进唯一索引
+op.execute("CREATE UNIQUE INDEX idx_memory_links_unique ON memory_links "
+  "(from_unit_id, to_unit_id, link_type, "
+  " COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid))")</code></pre>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ memory_links 的外键是 DEFERRABLE</p>
+        <p><code>from_unit_id</code>/<code>to_unit_id</code> 的外键被设为 <strong><code>DEFERRABLE INITIALLY DEFERRED</code></strong>,以打破"插边 vs 级联删"的死锁。代价是插边不能靠 <code>WHERE EXISTS</code> 防护,而要在同一条语句里对父单元加 <code>FOR KEY SHARE</code> 锁(第 05 章见过)。另外,约束里虽然还留着 <code>'entity'</code>,但那只为兼容历史行——Retain 已不再写实体边。</p>
+      </div>
+
+      <h2 id="obs">5. observation 不是独立的表(术语排雷)</h2>
+      <p>PostgreSQL 上<strong>没有 <code>observations</code> 表</strong>。巩固出的观察就是 <code>memory_units</code> 里 <code>fact_type='observation'</code> 的行,用那几个"仅 observation 用"的字段(<code>proof_count</code>、<code>source_memory_ids</code>、<code>history</code>、<code>observation_scopes</code>)。</p>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ "mental model" 一词三变,读 migration 别看名字</p>
+        <p>这个词在历史上指过三个不同的东西:<br>
+        (a) <code>memory_units</code> 里的一个 <code>fact_type</code>,后被 <code>t5o6p7q8r9s0</code> 改名为 <code>'observation'</code>;<br>
+        (b) 一张独立的 <code>mental_models</code> v4 表,后被 <code>p1k2l3m4n5o6</code> <strong>整张删掉</strong>;<br>
+        (c) HEAD 上的 <code>mental_models</code> 表,其实是 <code>reflections ← pinned_reflections</code> 改名而来,存的是 reflect 的结果(子类型 directive/pinned)。<br>
+        所以 CLAUDE.md 里"mental models = 巩固出的知识"这句话,在 HEAD 上对应的是 <code>fact_type='observation'</code> 的行,<strong>不是</strong> <code>mental_models</code> 表。这正是第 01 章强调"observation ≠ mental model"的由来。</p>
+      </div>
+
+      <h2 id="pgvector">6. pgvector:向量怎么存、怎么索引</h2>
+      <ul>
+        <li><strong>列</strong>:<code>memory_units.embedding</code>,类型 <code>vector(384)</code>。维度 384 是模块常量(<code>DEFAULT_EMBEDDING_DIMENSION</code>),<strong>不按 bank 可配</strong>——换模型导致维度变化时,靠重算而非混存(归档表 <code>invalidated_memory_units</code> 故意不带 embedding 列,免得"归档向量"和现役模型维度对不上,#2209)。</li>
+        <li><strong>索引</strong>:HNSW + 余弦(<code>vector_cosine_ops</code>)。向量后端<strong>可插拔</strong>(pgvector / pgvectorscale 的 diskann / vchord / scann),由 <code>_vector_index.py</code> 的 <code>_INDEX_USING_CLAUSES</code> 映射:</li>
+      </ul>
+      <div class="code-block">
+        <div class="code-header"><span>_vector_index.py · _INDEX_USING_CLAUSES</span><span class="lang">python</span></div>
+        <pre><code class="language-python">_INDEX_USING_CLAUSES = {
+    "pgvector":      "USING hnsw (embedding vector_cosine_ops)",
+    "pgvectorscale": "USING diskann (embedding vector_cosine_ops) WITH (num_neighbors = 50)",
+    "pg_diskann":    "USING diskann (embedding vector_cosine_ops) WITH (max_neighbors = 50)",
+    "vchord":        "USING vchordrq (embedding vector_cosine_ops)",
+    "scann":         "USING scann (embedding cosine) WITH (mode = 'AUTO')",
+}</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 HEAD 上:全局索引已删,改为每 bank × 每 fact_type 偏索引</p>
+        <p>早期是一个全局 HNSW 索引。migration <code>d5e6f7a8b9c0</code> 把它删了,改成对每个 bank 建三个偏索引:<code>idx_mu_emb_{worl|expr|obsv}_{internal_id前16位}</code>。为什么?因为检索 SQL 总是带 <code>WHERE bank_id = … AND fact_type = …</code> 再 <code>ORDER BY embedding &lt;=&gt; …</code>;偏索引让规划器直接走小索引,而不是被全局索引"竞争"掉。索引名用 <code>internal_id</code> 而非 <code>bank_id</code>,是为了<strong>名字稳定且不超 PostgreSQL 63 字符标识符上限</strong>。检索时(第 07 章)每个 fact_type 一个 UNION ALL 分支,正是为了命中这些偏索引。</p>
+      </div>
+
+      <h2 id="fts">7. 全文检索(BM25)的存储</h2>
+      <p>与向量并行,<code>memory_units</code> 还有一个 <code>search_vector</code> 列。默认后端是原生 tsvector:</p>
+      <div class="code-block">
+        <div class="code-header"><span>initial_schema.py · 生成的全文列</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">ALTER TABLE memory_units
+ADD COLUMN search_vector tsvector
+GENERATED ALWAYS AS (
+  to_tsvector('english', COALESCE(text, '') || ' ' || COALESCE(context, ''))
+) STORED;</code></pre>
+      </div>
+      <p>但 <code>search_vector</code> 的<strong>类型随后端而变</strong>:原生 → 生成的 tsvector;pg_textsearch/pg_search → 哑 TEXT 列 + 基列上的索引;vchord → <code>bm25_catalog.bm25vector</code>。所以运行时插入要按后端分支(第 07 章的 BM25 检索也会用到这个列)。</p>
+
+      <h2 id="tenancy">8. 多租户:三层隔离</h2>
+      <div class="diagram">
+        <div class="mermaid">
+flowchart TB
+  subgraph s1["机制1 · 每租户一个 PostgreSQL schema"]
+    A["migration 带 target_schema<br/>SET search_path TO tenant_x, public"]
+  end
+  subgraph s2["机制2 · 运行时 contextvar + 全限定"]
+    B["鉴权后 _current_schema.set(...)<br/>fq_table() 把表名拼成 schema.table"]
+  end
+  subgraph s3["机制3 · bank 逻辑隔离"]
+    C["同一 schema 内,每张表带 bank_id<br/>WHERE bank_id = $n"]
+  end
+  s1 --> s2 --> s3
+        </div>
+        <div class="diagram-caption">图 2-2:三层隔离。schema 做物理隔离,<code>fq_table</code> 做运行时限定,<code>bank_id</code> 做同 schema 内的逻辑隔离。</div>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/schema.py · fq_table</span><span class="lang">python</span></div>
+        <pre><code class="language-python">def fq_table(table_name: str) -&gt; str:
+    if _is_oracle():
+        return table_name              # Oracle 用 ALTER SESSION SET CURRENT_SCHEMA
+    from .memory_engine import get_current_schema
+    return f"{get_current_schema()}.{table_name}"   # PG: schema.table</code></pre>
+      </div>
+      <p>要点:migration 树会<strong>对每个租户 schema 各跑一遍</strong>(<code>hindsight-admin run-db-migration --schema tenant_xyz</code>);当前 schema 存在 contextvar 里,租户鉴权后设置;<strong>所有</strong>原始 SQL 都经 <code>fq_table()</code> 全限定。bank 之间则<strong>不靠外键或行级安全</strong>,而是每条查询的 <code>WHERE bank_id = $n</code>——在 PG 上,数据表对 <code>banks</code> 根本没有外键(Oracle 基线更严格,加了 <code>ON DELETE CASCADE</code> 的 bank 外键)。</p>
+
+      <h2 id="gotchas">9. 本章易踩坑清单</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>坑</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td><code>chunk_id</code> 确定性</td><td><code>{bank}_{doc}_{index}</code>,幂等 upsert,覆盖即正确</td></tr>
+            <tr><td>两级 content_hash</td><td>块级 <code>sha256(chunk_text)</code> + 文档级 hash,驱动 delta;即使不存原文也照算 hash</td></tr>
+            <tr><td>实体边被派生</td><td><code>memory_links</code> 不再存实体边;<code>/graph</code> 从 <code>unit_entities</code> 现算(曾占 53% 的边、约 190MB)</td></tr>
+            <tr><td>可空 <code>entity_id</code></td><td>唯一索引用 nil-UUID 顶替 NULL</td></tr>
+            <tr><td>术语漂移</td><td>mental model 一词三变;opinion fact_type 已被整体删除;读 migration 别看名字</td></tr>
+            <tr><td><code>models.py</code> 滞后</td><td>ORM 缺 <code>search_vector</code>/<code>tags</code>/<code>proof_count</code>/<code>source_memory_ids</code> 等;以 migrations 为准</td></tr>
+            <tr><td>observation 溯源按方言</td><td>PG 用 <code>source_memory_ids[]</code> 数组;Oracle 用 <code>observation_sources</code> 连接表</td></tr>
+            <tr><td>作废即搬走</td><td>被作废的事实移到 <code>invalidated_memory_units</code>(无 embedding 列),检索永不读它</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="summary">
+        <h2>小结</h2>
+        <ul>
+          <li>中心表是 <code>memory_units</code>(一行一事实),兼存 embedding、search_vector、四个时间字段和巩固记账。</li>
+          <li>图 = <code>entities</code> + <code>unit_entities</code> + <code>memory_links</code>(三种边,可空列用 nil-UUID,外键 DEFERRABLE)。</li>
+          <li>observation 是 <code>fact_type='observation'</code> 的行,<strong>不是独立表</strong>;别和 <code>mental_models</code> 表混。</li>
+          <li>向量:pgvector 384 维 HNSW,HEAD 上是每 bank × 每 fact_type 偏索引;全文检索有并行的一列。</li>
+          <li>多租户三层:schema/search_path + contextvar/fq_table + <code>bank_id</code> WHERE。</li>
+        </ul>
+        <p>地基打好了。下一章起,我们看 Retain 如何往这些表里写数据。</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="assets/js/mermaid.min.js"></script>
+  <script src="assets/js/highlight.min.js"></script>
+  <script src="assets/js/course.js"></script>
+</body>
+</html>

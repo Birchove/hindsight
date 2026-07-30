@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>12 · 生态全景 — Hindsight 源码精读</title>
+  <link rel="stylesheet" href="assets/css/course.css">
+  <link rel="stylesheet" href="assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="目录">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">第六部分 · 生态概览</p>
+      <h1>12 · 生态全景</h1>
+      <p class="lead">前 11 章都在 <code>hindsight-api-slim/</code> 里。这一章跳出来,鸟瞰整个 monorepo:系统怎么<strong>被打包、被部署、被集成</strong>进各种框架,控制台和 CLI 长什么样,基准怎么跑。这一章不逐行读代码,而是建立"这个项目作为一个产品长什么样"的地图——并对你说的"其余实现方式,对比介绍即可"做个交代。</p>
+
+      <div class="keypoints">
+        <h3>本章要点</h3>
+        <ul>
+          <li>同一个引擎有三种交付形态:<strong>独立服务器</strong>(Docker)、<strong>Python 嵌入</strong>(<code>hindsight-all</code>,自带 pg0)、<strong>npm 嵌入</strong>(<code>hindsight-all-npm</code>)。</li>
+          <li>客户端有 <strong>4 种语言 SDK</strong>(Python/TS/Rust/Go),都从 OpenAPI 生成;CLI 是 Rust;还有"两行代码"的 LLM Wrapper。</li>
+          <li><strong>49 个框架集成</strong>大多是同一个模式的变体:把 retain/recall/reflect 包进框架的"记忆/工具"接口。</li>
+          <li>control plane 是 Next.js 管理 UI,<strong>代理</strong>调用 dataplane;加 API 参数时两边要同步改。</li>
+          <li>存储默认<strong>内嵌 pg0</strong>,也支持外部 PostgreSQL 与 Oracle 23ai(功能对等);migration 用方言分发。</li>
+        </ul>
+      </div>
+
+      <h2 id="shapes">1. 三种"跑起来"的形态</h2>
+      <p>引擎只有一份,但交付形态有三种,适配不同场景:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>形态</th><th>包</th><th>数据库</th><th>适合</th></tr></thead>
+          <tbody>
+            <tr><td><strong>独立服务器</strong></td><td>Docker 镜像(<code>docker/standalone</code>、<code>docker/docker-compose</code>)</td><td>内嵌 pg0,或外挂 PostgreSQL</td><td>生产、多客户端共享</td></tr>
+            <tr><td><strong>Python 嵌入</strong></td><td><code>hindsight-all</code>(Intel Mac 用 <code>hindsight-all-slim</code>)</td><td>内嵌 pg0,无需外部依赖</td><td>本地开发、单机、脚本里直接用</td></tr>
+            <tr><td><strong>npm 嵌入</strong></td><td><code>hindsight-all-npm</code></td><td>内嵌</td><td>Node/TS 项目里直接用</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 pg0:让"零依赖"成为可能的内嵌 Postgres</p>
+        <p>Hindsight 离不开 PostgreSQL + pgvector。为了不让用户先装一个数据库,它把 PostgreSQL <strong>内嵌</strong>成 <code>pg0</code>(数据放在 <code>~/.pg0</code>)。所以 <code>docker run</code> 一条命令、或 <code>pip install hindsight-all</code> 之后,数据库是自动起来的。这也是为什么 <code>pg0.py</code>、<code>daemon.py</code> 这些文件存在。第 02 章讲的"每个租户一个 schema"的多租户,在这之上照样成立。</p>
+      </div>
+      <p>README 里"最简集成"其实是 <strong>LLM Wrapper</strong>:把你现有的 LLM 客户端换成 Hindsight 的包装器,之后每次 LLM 调用会<strong>自动</strong>存取记忆,号称两行代码。若需要更细的控制,才用 SDK/HTTP 直接调三个操作。</p>
+
+      <h2 id="clients">2. 客户端、SDK 与 CLI</h2>
+      <ul>
+        <li><strong>SDK</strong>:<code>hindsight-clients/</code> 下有 <strong>Python、TypeScript、Rust、Go</strong> 四种。它们是<strong>生成的</strong>——改了 API 后跑 <code>./scripts/generate-openapi.sh</code> 重新生成 OpenAPI 规格,再跑 <code>./scripts/generate-clients.sh</code> 重生成全部 SDK。所以<strong>别手改生成的客户端</strong>。</li>
+        <li><strong>CLI</strong>:<code>hindsight-cli/</code> 是 Rust 写的(自称 "A beautiful CLI for Hindsight"),用 <strong>progenitor</strong> 从 OpenAPI 生成 API 客户端。</li>
+        <li><strong>嵌入式 CLI</strong>:<code>hindsight-embed/</code> 提供"无需服务器的本地记忆操作"。</li>
+      </ul>
+      <div class="callout tip">
+        <p class="callout-title">✅ 一条贯穿全仓库的纪律:先改 API,再重生成</p>
+        <p>API 是"单一事实来源"。改 dataplane 端点后:<strong>① 重生成 OpenAPI 规格(CI 会校验)→ ② 重生成 SDK → ③ 同步改 control plane 的代理路由与类型</strong>。这条链条解释了为什么仓库里那么多东西是"生成的"——为了让四种语言 + CLI + UI 永远和 API 对齐。</p>
+      </div>
+
+      <h2 id="integrations">3. 集成生态:49 个,一个模式</h2>
+      <p><code>hindsight-integrations/</code> 下有 <strong>49 个</strong>框架集成:LangGraph、CrewAI、Pydantic AI、AutoGen/AG2、Claude Code、Cursor、Cline、LlamaIndex、Haystack、n8n、Dify……数量吓人,但<strong>绝大多数是同一个模式的变体</strong>:</p>
+      <div class="diagram">
+        <div class="mermaid">
+flowchart LR
+  subgraph fw["某个 Agent 框架"]
+    HOOK["框架的'记忆/工具'挂载点<br/>(如 pre/post 钩子、Tool、Memory 类)"]
+  end
+  subgraph adapter["Hindsight 集成(薄薄的适配层)"]
+    A["把框架的消息/上下文<br/>翻译成 retain 输入"]
+    B["把框架的'需要记忆'时机<br/>翻译成 recall/reflect 调用"]
+  end
+  subgraph hs["Hindsight 服务器"]
+    API["retain / recall / reflect"]
+  end
+  HOOK --> A --> API
+  HOOK --> B --> API
+        </div>
+        <div class="diagram-caption">图 12-1:集成的通用形态。框架各异,但适配层做的事高度同构:在合适的时机调 retain,在需要上下文时调 recall/reflect。</div>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 怎么读这 49 个(不用都读)</p>
+        <p>挑<strong>一个</strong>你熟悉的框架的集成读透(比如你用过 LangGraph 就读 <code>langgraph/</code>,用过 Claude Code 就读 <code>claude-code/</code>),搞清它"在哪个钩子、把什么、翻译成哪个操作"。其余的<strong>扫一眼 README 即可</strong>——差异主要在"框架的挂载点叫什么、消息结构长什么样",而不是 Hindsight 这边。</p>
+      </div>
+      <p>仓库对"新增集成"有硬性清单(来自 CLAUDE.md,正好说明一个"完整集成"包含什么):</p>
+      <ol>
+        <li><strong>必须有测试</strong>——要模拟/驱动外部系统(mock 框架接口,验证集成确实正确调用了 Hindsight);纯 helper 单测不算。</li>
+        <li><strong>CI job</strong>——在 <code>.github/workflows/test.yml</code> 按现有模式加(构建、装依赖、<code>uv run pytest tests -v</code>),并接入 <code>detect-changes</code> 只在文件变化时跑。</li>
+        <li><strong>发布</strong>——把集成名加进 <code>scripts/release-integration.sh</code> 的 <code>VALID_INTEGRATIONS</code>。</li>
+        <li><strong>遵守代码规范</strong>——Python 风格、类型安全、结构化数据不用裸 dict、不多项 tuple 返回。</li>
+      </ol>
+
+      <h2 id="cp">4. 控制台(Control Plane)</h2>
+      <p><code>hindsight-control-plane/</code> 是一个 <strong>Next.js</strong> 管理 UI(页面有 dashboard / banks / login 等),默认跑在 9999 端口。它<strong>自己不存数据</strong>,而是<strong>代理</strong>调用 dataplane API。它的 API 路由几乎和 dataplane 一一对应:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>control plane 路由(<code>src/app/api/</code>)</th><th>对应</th></tr></thead>
+          <tbody>
+            <tr><td><code>recall</code> / <code>reflect</code> / <code>memories</code>(retain)</td><td>三大操作</td></tr>
+            <tr><td><code>banks</code> / <code>profile</code> / <code>stats</code></td><td>bank 管理与统计</td></tr>
+            <tr><td><code>documents</code> / <code>chunks</code> / <code>entities</code> / <code>graph</code></td><td>记忆内容浏览与可视化</td></tr>
+            <tr><td><code>operations</code> / <code>extract</code> / <code>files</code> / <code>health</code> / <code>version</code></td><td>运维与工具</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ 加 API 参数,记得两边同步</p>
+        <p>CLAUDE.md 专门强调:在 dataplane 加/改参数时,control plane 要同步改三处——<strong>① 路由处理器</strong>(从 body 解构出参数、传给 SDK 调用)、<strong>② 客户端类型</strong>(<code>src/lib/api.ts</code> 里 <code>recall()/reflect()/retain()</code> 的类型)、<strong>③ 用到它的 UI 组件</strong>。漏一处,UI 上就用不了新参数。</p>
+      </div>
+
+      <h2 id="storage">5. 存储与部署</h2>
+      <ul>
+        <li><strong>默认内嵌 pg0</strong>,零依赖;生产可换<strong>外部 PostgreSQL</strong>(<code>docker/docker-compose</code>)。</li>
+        <li><strong>Oracle 23ai</strong> 也支持,且"功能对等"。这解释了代码里大量的<strong>方言分发</strong>:每个 migration 通过 <code>run_for_dialect(pg=..., oracle=...)</code> 选择 <code>_pg_upgrade</code> 或 <code>_oracle_upgrade</code>(第 02 章那些"Oracle 没有 unnest、observation 用连接表"的差异就是这么来的)。有个 pytest lint(<code>test_migration_shape.py</code>)会在 migration 漏掉分发器时挂 CI。</li>
+        <li><strong>向量后端可插拔</strong>(pgvector/diskann/vchord/scann,第 02 章)、<strong>全文后端可插拔</strong>(原生 tsvector / pg_search / pgroonga / vchord,第 07 章)。</li>
+        <li>编排:<code>helm/</code>(K8s)、<code>monitoring/</code>(监控);配置模板是 <code>.env.example</code>(setup 脚本会拷成 <code>.env</code>)。</li>
+      </ul>
+
+      <h2 id="bench">6. 基准与可观测性</h2>
+      <p><code>hindsight-dev/</code> 与 <code>scripts/benchmarks/</code> 提供:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>基准</th><th>测什么</th><th>脚本</th></tr></thead>
+          <tbody>
+            <tr><td><strong>LongMemEval</strong></td><td>长期记忆的<strong>准确率</strong>(Hindsight 宣称 SOTA)</td><td><code>run-longmemeval.sh</code></td></tr>
+            <tr><td><strong>LoCoMo</strong></td><td>另一套准确率基准</td><td><code>run-locomo.sh</code></td></tr>
+            <tr><td><strong>性能</strong></td><td>系统吞吐/延迟(mock LLM + pg0,<code>--scale tiny</code> 做冒烟)</td><td><code>run-perf-test.sh</code></td></tr>
+            <tr><td><strong>巩固</strong></td><td>consolidation 的表现</td><td><code>run-consolidation.sh</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>结果可以用 <code>start-visualizer.sh</code> 在 <code>localhost:8001</code> 看。可观测性方面,引擎内置 <code>metrics.py</code>(Prometheus 风格)、<code>tracing.py</code>、<code>llm_trace.py</code>(记录每次 LLM 调用,第 11 章的 usage stash 就喂给它)。</p>
+
+      <h2 id="config-recap">7. 配置体系回顾</h2>
+      <p>把所有配置知识收个尾(详见第 11 章):配置是<strong>层级的</strong>——<strong>全局(env)→ 租户(经扩展)→ bank(数据库)</strong>。字段分两类:</p>
+      <ul>
+        <li><strong>可配置(hierarchical)</strong>:能被租户/bank 覆盖——LLM 行为设置、retain 模式、chunk 大小、mission、disposition、recall 预算等。</li>
+        <li><strong>静态(server 级)</strong>:数据库 URL、端口、全局并发上限、以及(注意)<strong>LLM provider/model/key</strong>。</li>
+      </ul>
+      <p>加一个新配置字段的标准流程(来自 CLAUDE.md):在 <code>config.py</code> 加 <code>ENV_*</code>/<code>DEFAULT_*</code>/dataclass 字段,可配就加进 <code>_CONFIGURABLE_FIELDS</code>;引擎里用 <code>ConfigResolver.get_bank_config</code> 按 bank 解析;文档与 <code>.env.example</code> 同步;<code>.env.example</code> 改完还要拷一份到 <code>hindsight-embed/</code>(有个同步测试盯着)。</p>
+
+      <div class="summary">
+        <h2>小结</h2>
+        <ul>
+          <li>一份引擎,三种交付:Docker 服务器 / Python 嵌入 / npm 嵌入;pg0 让零依赖成为可能。</li>
+          <li>4 种 SDK + Rust CLI 都从 OpenAPI 生成;改 API 要走"重生成 + 同步 control plane"的链条。</li>
+          <li>49 个集成 = 一个模式的 49 个变体;读透一个、扫其余;新增集成有硬性清单。</li>
+          <li>control plane 是代理型 Next.js UI;存储默认 pg0,可换 PG/Oracle(方言分发)。</li>
+          <li>基准分准确率(LongMemEval/LoCoMo)与性能两类;配置层级化、字段分可配/静态。</li>
+        </ul>
+        <p>到这里,从核心引擎到外围生态的导览就完成了。最后的附录给你一张"按职责找文件"的跳读地图、术语表,以及本地运行/调试/读测试的速查。</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="assets/js/mermaid.min.js"></script>
+  <script src="assets/js/highlight.min.js"></script>
+  <script src="assets/js/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>附录 · 源码跳读地图与术语表 — Hindsight 源码精读</title>
+  <link rel="stylesheet" href="assets/css/course.css">
+  <link rel="stylesheet" href="assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="目录">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">附录</p>
+      <h1>A · 源码跳读地图与术语表</h1>
+      <p class="lead">这一页是工具页:按职责找文件、值得收藏的跳转函数、最容易混的概念、issue 编号速查、本地运行/调试/读测试的方法,以及一份术语表。读源码时随手查。</p>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ 最重要的三条读码纪律</p>
+        <p>① <strong>按层读</strong>:API 适配 → Engine 门面 → 流水线包,别跨层找东西。② <strong>按函数跳</strong>:两个巨石文件(<code>memory_engine.py</code> ~1.4 万行、<code>api/http.py</code> ~7.5 千行)绝不整文件读。③ <strong>行号会漂移</strong>:一律以"文件路径 + 函数名"定位;本课代码片段为讲解做了节选。</p>
+      </div>
+
+      <h2 id="filemap">A. 按职责找文件</h2>
+      <p>路径前缀:<code>hindsight-api-slim/hindsight_api/</code>。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>文件</th><th>一句话</th><th>何时打开</th></tr></thead>
+          <tbody>
+            <tr><td><code>api/http.py</code></td><td>HTTP 模型 + 各操作入口(<code>api_retain</code>/<code>api_recall</code>/<code>api_reflect</code>)</td><td>看入参与分流</td></tr>
+            <tr><td><code>api/mcp.py</code></td><td>MCP server 实现</td><td>MCP 集成</td></tr>
+            <tr><td><code>engine/memory_engine.py</code></td><td>总门面、切批、异步、worker handler</td><td><strong>只跳函数名</strong></td></tr>
+            <tr><td><code>config.py</code> / <code>config_resolver.py</code></td><td>配置字段 / 层级解析 / <code>apply_strategy</code></td><td>配置行为</td></tr>
+            <tr><td><code>engine/retain/orchestrator.py</code></td><td>retain 总编排(文档级骨架 + streaming)</td><td>主读</td></tr>
+            <tr><td><code>engine/retain/fact_extraction.py</code></td><td>切块 + LLM 抽事实 + prompt</td><td>关心抽取质量</td></tr>
+            <tr><td><code>engine/retain/fact_storage.py</code> / <code>chunk_storage.py</code></td><td>文档/事实持久化 / chunk hash 存取</td><td>看落库、delta/recovery</td></tr>
+            <tr><td><code>engine/retain/link_utils.py</code> / <code>link_creation.py</code></td><td>建边实现 / 薄封装</td><td>深挖边算法</td></tr>
+            <tr><td><code>engine/retain/types.py</code></td><td>管道数据结构</td><td>理清字段</td></tr>
+            <tr><td><code>engine/entity_resolver.py</code></td><td>实体抽取与归一</td><td>第 05 章</td></tr>
+            <tr><td><code>engine/search/retrieval.py</code></td><td>四路检索编排</td><td>第 06–07 章</td></tr>
+            <tr><td><code>engine/search/link_expansion_retrieval.py</code></td><td>图检索(链扩展)</td><td>第 07 章</td></tr>
+            <tr><td><code>engine/search/fusion.py</code> / <code>reranking.py</code> / <code>recall_boost.py</code></td><td>RRF / 重排编排 / 策略加权</td><td>第 08 章</td></tr>
+            <tr><td><code>engine/cross_encoder.py</code></td><td>重排模型抽象(local/TEI/多家)</td><td>第 08、11 章</td></tr>
+            <tr><td><code>engine/query_analyzer.py</code> / <code>search/temporal_extraction.py</code></td><td>查询分析(时间约束)</td><td>第 06 章</td></tr>
+            <tr><td><code>engine/reflect/agent.py</code> / <code>tools.py</code> / <code>prompts.py</code></td><td>reflect 循环 / 工具 / prompt</td><td>第 10 章</td></tr>
+            <tr><td><code>engine/consolidation/consolidator.py</code> / <code>prompts.py</code></td><td>巩固 job / prompt</td><td>第 09 章</td></tr>
+            <tr><td><code>engine/llm_wrapper.py</code> / <code>llm_interface.py</code> / <code>providers/</code></td><td>LLM 门面 / 契约 / 各 provider</td><td>第 11 章</td></tr>
+            <tr><td><code>engine/embeddings.py</code></td><td>embedding 抽象(local/TEI/多家)</td><td>第 11 章</td></tr>
+            <tr><td><code>engine/db/ops_postgresql.py</code></td><td>手写 asyncpg SQL(权威 schema 用法)</td><td>看真实 SQL</td></tr>
+            <tr><td><code>alembic/versions/</code></td><td>schema 的权威来源(~89 个)</td><td>看真实列</td></tr>
+            <tr><td><code>worker/poller.py</code></td><td>领任务 / parent 聚合 / 槽位预留</td><td>异步运维</td></tr>
+            <tr><td><code>extensions/memory_defense.py</code></td><td>写入前防御(ALLOW/REDACT/BLOCK)</td><td>安全策略</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="jump">B. 值得收藏的跳转函数</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>定位</th><th>读它为了什么</th></tr></thead>
+          <tbody>
+            <tr><td><code>http.py · api_retain / api_recall / api_reflect</code></td><td>请求如何变成 engine 调用</td></tr>
+            <tr><td><code>memory_engine.py · retain_batch_async / _retain_batch_async_internal</code></td><td>retain 护栏与切批 / 进编排</td></tr>
+            <tr><td><code>memory_engine.py · submit_async_retain / _handle_batch_retain</code></td><td>异步入队与幂等 / worker 接回</td></tr>
+            <tr><td><code>memory_engine.py · _search_with_retries</code></td><td>recall 的融合/重排/裁剪编排(主体在这)</td></tr>
+            <tr><td><code>memory_engine.py · _filter_by_token_budget</code></td><td>token 裁剪</td></tr>
+            <tr><td><code>retain/orchestrator.py · retain_batch / _streaming_retain_batch</code></td><td>文档级骨架 / 主执行循环</td></tr>
+            <tr><td><code>retain/orchestrator.py · _pre_resolve_phase1 / _insert_facts_and_links / _run_final_semantic_ann / _remap_phase1_results</code></td><td>Phase1/2/3 与占位重映射</td></tr>
+            <tr><td><code>retain/orchestrator.py · _try_delta_retain</code></td><td>增量路径</td></tr>
+            <tr><td><code>retain/fact_extraction.py · chunk_text / extract_facts_from_contents / _build_extraction_prompt_and_schema / _extract_facts_chunks</code></td><td>切块 / 抽取 / prompt / chunks 模式</td></tr>
+            <tr><td><code>entity_resolver.py · _resolve_from_candidates / reassert_entities_batch</code></td><td>归一打分 / 堵 prune 窗口</td></tr>
+            <tr><td><code>link_utils.py · compute_temporal_links / compute_semantic_links_ann / _write_causal_links_batch / _bulk_insert_links</code></td><td>三种边 + 共享写入</td></tr>
+            <tr><td><code>search/retrieval.py · retrieve_all_fact_types_parallel / retrieve_semantic_bm25_combined / retrieve_temporal_combined</code></td><td>四路编排 / 语义+BM25 / 时间</td></tr>
+            <tr><td><code>link_expansion_retrieval.py · retrieve</code></td><td>图扩展</td></tr>
+            <tr><td><code>fusion.py · reciprocal_rank_fusion / interleave_fusion</code></td><td>RRF / 轮询融合</td></tr>
+            <tr><td><code>reranking.py · CrossEncoderReranker.rerank / apply_combined_scoring</code></td><td>重排 / 合并打分</td></tr>
+            <tr><td><code>query_analyzer.py · DateparserQueryAnalyzer.analyze / _date_match_score</code></td><td>时间抽取 / 防假阳性</td></tr>
+            <tr><td><code>reflect/agent.py · _run_reflect_agent_inner</code></td><td>reflect 循环</td></tr>
+            <tr><td><code>consolidation/consolidator.py · run_consolidation_job / _process_memory_batch / _resolve_obs_tags_list</code></td><td>巩固主流程 / scopes</td></tr>
+            <tr><td><code>config_resolver.py · resolve_full_config / apply_strategy</code></td><td>层级解析 / strategy 覆盖</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="confuse">C. 易混概念速查</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>容易混</th><th>澄清</th></tr></thead>
+          <tbody>
+            <tr><td><code>retain_async</code> vs <code>retain_batch_async</code></td><td>前者是单条薄封装,逻辑在后者</td></tr>
+            <tr><td><code>extract_facts_from_contents</code> vs <code>..._batch_api</code></td><td>后者是供应商 Batch API 路径,配置启用才走</td></tr>
+            <tr><td><code>types.ExtractedFact</code> vs <code>fact_extraction</code> 里的 Pydantic 模型</td><td>管道对象 vs LLM schema,不同层</td></tr>
+            <tr><td>两个 <code>generate_embeddings_batch</code></td><td><code>embedding_processing</code>(包装)vs <code>embedding_utils</code>(实现)</td></tr>
+            <tr><td><code>document_tags</code> vs item <code>tags</code></td><td>前者 deprecated,用 item 级 tags</td></tr>
+            <tr><td>同步切批 vs 异步 child 切批</td><td><code>_split_contents_into_sub_batches</code> vs <code>_split_contents_into_async_children</code>,约束不同</td></tr>
+            <tr><td>fact_type <code>world/assistant</code> vs <code>world/experience</code></td><td>抽取 prompt 用前者,落库映射成后者(第 04 章)</td></tr>
+            <tr><td><strong>observation</strong> vs <strong>mental model</strong></td><td>自动巩固的事实行 vs 用户固化的 reflect 结果(独立表)(第 01、09、10 章)</td></tr>
+            <tr><td><strong>disposition</strong> vs <strong>directive</strong></td><td>软(一行 k=v)vs 硬(MANDATORY + 合规交代)(第 10 章)</td></tr>
+            <tr><td><code>LLMConfig</code></td><td>不是配置对象,就是 <code>LLMProvider</code> 的别名(第 11 章)</td></tr>
+            <tr><td>"层级 LLM 配置"</td><td>provider/model/key 实为服务器级 + 按操作,非 per-bank(第 11 章)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="issues">D. 三组张力 + issue 编号速查</h2>
+      <p>源码注释里的 <code>#xxxx</code> 基本对应三组张力(第 01 章)在现实中咬过的坑:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>编号</th><th>讲什么</th></tr></thead>
+          <tbody>
+            <tr><td>#1875</td><td>sanitize 掉会打崩 embedder 的坏 Unicode</td></tr>
+            <tr><td>#1833</td><td>抽取失败必须响亮,不能静默 0-fact 标成功</td></tr>
+            <tr><td>#1888</td><td>多片切分的 <code>chunk_index_offset</code>,防块号冲突</td></tr>
+            <tr><td>#2301</td><td>切块幂等:再切不能碎,否则撞 <code>chunk_id</code></td></tr>
+            <tr><td>#1795</td><td>超大单条不拆并发兄弟,进程内顺序切</td></tr>
+            <tr><td>#1838</td><td><code>document_body_override</code> 保证存全文而非最后一片</td></tr>
+            <tr><td>#1680</td><td>bank_id 形如路由键时不注入 narrator</td></tr>
+            <tr><td>#2662</td><td>Phase1/2 之间实体被 prune 的窗口;<code>reassert_entities_batch</code> 修</td></tr>
+            <tr><td>#2768</td><td>dateparser 假阳性;用打分而非黑名单</td></tr>
+            <tr><td>#2209</td><td>embedding 维度随模型;归档表不带 embedding 列</td></tr>
+            <tr><td>#2387</td><td>usage 在校验前 stash,失败也计费要记账</td></tr>
+            <tr><td>#3002</td><td>并发许可排队阶段要可观测,别对着没到的任务排查</td></tr>
+            <tr><td>#1842</td><td>异步提交去重时锁 bank 行 <code>FOR NO KEY UPDATE</code></td></tr>
+            <tr><td>#2864</td><td>因果边不可再生,作废时快照</td></tr>
+            <tr><td>GH-1558</td><td>label 实体只做精确匹配,不模糊归并</td></tr>
+            <tr><td>#2529</td><td>图维护的幂等扫描死锁重试</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="run">E. 本地运行与调试速查</h2>
+      <div class="code-block">
+        <div class="code-header"><span>shell</span><span class="lang">bash</span></div>
+        <pre><code class="language-bash"># 1) 准备配置
+cp .env.example .env        # 填 LLM provider/key;无 key 可设 HINDSIGHT_API_LLM_PROVIDER=none
+
+# 2) 起服务(仓库脚本,自动读 .env)
+./scripts/dev/start.sh          # API + 控制台 UI
+./scripts/dev/start-api.sh      # 只起 API
+
+# 3) 或 Docker(自带内嵌 pg0)
+docker run -it -p 8888:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
+  -v hindsight-data:/home/hindsight/.pg0 ghcr.io/vectorize-io/hindsight:latest
+
+# 4) 或 Python 嵌入(无需服务器)
+pip install hindsight-all -U
+
+# API: http://localhost:8888   UI: http://localhost:9999</code></pre>
+      </div>
+      <p>常用环境变量(详见 <code>.env.example</code> 与第 11 章):<code>HINDSIGHT_API_LLM_PROVIDER</code>(openai/anthropic/gemini/groq/ollama/lmstudio/minimax/<strong>none</strong>)、<code>HINDSIGHT_API_LLM_API_KEY</code>、<code>HINDSIGHT_API_LLM_MODEL</code>、<code>HINDSIGHT_API_EMBEDDINGS_PROVIDER</code>(local/tei)、<code>HINDSIGHT_API_RERANKER_PROVIDER</code>(local/tei)、<code>HINDSIGHT_API_DATABASE_URL</code>(不设则用内嵌 pg0)。</p>
+      <div class="callout tip">
+        <p class="callout-title">✅ 调试建议</p>
+        <p>· <strong>想单步</strong>:用 <code>start-api.sh</code> 起的进程(或直接在 IDE 里跑 <code>hindsight_api.main</code>),在编排器函数(如 <code>_streaming_retain_batch</code>、<code>_search_with_retries</code>)打断点。<br>
+        · <strong>不想花钱</strong>:设 provider=<code>none</code>(走 chunks 模式、关巩固),或跑测试用 <code>MockLLM</code>(确定性、按 scope 返回罐头)。读代码本身<strong>不需要任何 key</strong>。<br>
+        · <strong>看 SQL</strong>:真实 SQL 在 <code>engine/db/ops_postgresql.py</code>,配合 <code>EXPLAIN</code> 理解偏索引命中。</p>
+      </div>
+
+      <h2 id="tests">F. 测试导读</h2>
+      <p>测试目录 <code>hindsight-api-slim/tests/</code>,分两类:</p>
+      <ul>
+        <li><strong>确定性测试(大多数)</strong>:用 <code>MockLLM</code>、纯函数,直接 assert。读这些最快建立"预期行为":<code>test_delta_retain.py</code>、<code>test_retain_append_mode.py</code>、<code>test_async_batch_retain.py</code>、<code>test_async_retain_operation_id.py</code>、<code>test_retain_same_document_concurrency.py</code>、<code>test_retain_transient_extraction_failure.py</code>。</li>
+        <li><strong>LLM 行为测试</strong>:验证"模型如何解读 prompt"时,MockLLM 模拟不了,精确断言又会跨 provider 抖动。于是用<strong>真 LLM + LLM-as-judge</strong>:标 <code>pytestmark = pytest.mark.hs_llm_core</code>,跑真管线,再用 <code>tests/llm_judge.assert_meets_criteria</code> 判定(判官模型独立于被测 provider,默认 Gemini)。<strong>结构性</strong>的确定事实(计数、字段存在、某子串被注入 prompt)仍用快速单测直接 assert。</li>
+      </ul>
+      <div class="code-block">
+        <div class="code-header"><span>shell</span><span class="lang">bash</span></div>
+        <pre><code class="language-bash">cd hindsight-api-slim
+uv run pytest tests/ -n auto                 # 并行跑全部
+uv run pytest tests/test_retain.py::test_retain_simple -v   # 跑单个
+uv run ruff check . && uv run ruff format .  # lint/格式化
+uv run ty check hindsight_api/               # 极快的类型检查
+./scripts/hooks/lint.sh                       # 仓库统一 lint(改完 Python/TS 必跑)</code></pre>
+      </div>
+
+      <h2 id="glossary">G. 术语表</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>术语</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td><strong>bank</strong></td><td>一个隔离的记忆库("某个用户/Agent 的大脑"),bank 间不串数据</td></tr>
+            <tr><td><strong>disposition</strong></td><td>bank 的性格三特质(skepticism/literalism/empathy,1–5),只影响 reflect</td></tr>
+            <tr><td><strong>memory_unit</strong></td><td>一条原子事实(数据库中心表的一行)</td></tr>
+            <tr><td><strong>fact_type</strong></td><td>world(世界)/experience(经历)/observation(巩固出的观察)</td></tr>
+            <tr><td><strong>chunk</strong></td><td>文档切块;主键确定性 <code>{bank}_{doc}_{index}</code></td></tr>
+            <tr><td><strong>entity / canonical_name</strong></td><td>归一后的实体;规范名先到先得、大小写不敏感</td></tr>
+            <tr><td><strong>unit_entities</strong></td><td>事实↔实体的连接表</td></tr>
+            <tr><td><strong>memory_links</strong></td><td>事实间的有类型带权边</td></tr>
+            <tr><td><strong>temporal/semantic/causal</strong></td><td>三种边:时间接近 / 向量相近 / 因果(只写 caused_by)</td></tr>
+            <tr><td><strong>observation</strong></td><td>巩固自底向上合成的观察(<code>fact_type='observation'</code>)</td></tr>
+            <tr><td><strong>mental model</strong></td><td>用户定义、按需刷新的固化 reflect 结果(<code>mental_models</code> 表)</td></tr>
+            <tr><td><strong>proof_count / source_memory_ids</strong></td><td>observation 的证据数 / 证据事实 ID 集</td></tr>
+            <tr><td><strong>observation_scopes</strong></td><td>巩固粒度:combined/per_tag/all_combinations/shared/自定义</td></tr>
+            <tr><td><strong>consolidation</strong></td><td>后台巩固:facts → observations 的"学习"</td></tr>
+            <tr><td><strong>RRF</strong></td><td>倒数排名融合,<code>Σ1/(60+rank)</code>,只用排名</td></tr>
+            <tr><td><strong>bi-encoder / cross-encoder</strong></td><td>双塔(分别编码,便宜)/ 交叉(拼接精排,贵)</td></tr>
+            <tr><td><strong>HNSW / pgvector</strong></td><td>近似最近邻索引 / Postgres 的向量扩展</td></tr>
+            <tr><td><strong>delta retain</strong></td><td>增量写入:只重抽变化的块(乐观读 + 事务内复核)</td></tr>
+            <tr><td><strong>streaming mini-batch</strong></td><td>按小批"抽取→建边→提交→释放",抗 OOM、可恢复</td></tr>
+            <tr><td><strong>Phase1/2/3</strong></td><td>事务外慢读 / 短事务原子写 / 提交后补边</td></tr>
+            <tr><td><strong>thinking_budget</strong></td><td>recall 的 top-k/节点预算(LOW100/MID300/HIGH~1000)</td></tr>
+            <tr><td><strong>directive</strong></td><td>reflect 的硬规则(MANDATORY)</td></tr>
+            <tr><td><strong>narrator</strong></td><td>抽取时注入的"第一人称是谁"提示</td></tr>
+            <tr><td><strong>pg0</strong></td><td>内嵌 PostgreSQL,实现零依赖</td></tr>
+            <tr><td><strong>TEI</strong></td><td>HuggingFace Text Embeddings Inference(远程 embedding/rerank)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="refs">H. 参考与说明</h2>
+      <ul>
+        <li><strong>上游仓库</strong>:<a href="https://github.com/vectorize-io/hindsight" target="_blank" rel="noopener">vectorize-io/hindsight</a> · <a href="https://hindsight.vectorize.io" target="_blank" rel="noopener">官方文档</a> · <a href="https://arxiv.org/abs/2512.12818" target="_blank" rel="noopener">论文</a></li>
+        <li><strong>本课程的依据</strong>:对当前 fork 源码的实际阅读 + 7 路并行的子代理交叉核对。关键论断尽量附源码对照;凡推断处会在文中标注。</li>
+        <li><strong>与仓库内文档的关系</strong>:根目录 <code>CLAUDE.md</code>/<code>AGENTS.md</code> 是原作者的<strong>开发规范</strong>,非本课程来源;<code>frame/</code> 是此前的简版 Retain 导读,本站在其叙事基础上大幅扩展(尤其 recall/reflect/consolidation/数据模型/LLM 层为全新内容)。</li>
+        <li><strong>站点本身</strong>:纯静态、离线可用(Mermaid 与 highlight.js 已内置)。直接打开 <code>index.html</code>,或 <code>python -m http.server</code> 后访问。</li>
+      </ul>
+
+      <div class="footer-note">
+        恭喜读到这里 🎉 你现在应当能独立打开 <code>hindsight-api-slim/</code>,按"层 → 函数"跳读,并对每一处"为什么这么复杂"给出答案。<br>
+        返回 <a href="index.html">课程导读</a> · 重读 <a href="ch01-big-picture.html">第 01 章</a>。
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="assets/js/mermaid.min.js"></script>
+  <script src="assets/js/highlight.min.js"></script>
+  <script src="assets/js/course.js"></script>
+</body>
+</html>

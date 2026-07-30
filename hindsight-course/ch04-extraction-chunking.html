@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>04 · 事实抽取与切块 — Hindsight 源码精读</title>
+  <link rel="stylesheet" href="assets/css/course.css">
+  <link rel="stylesheet" href="assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="目录">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">第二部分 · 写入 Retain</p>
+      <h1>04 · 事实抽取与切块</h1>
+      <p class="lead">上一章我们走完了 Retain 的骨架。这一章钻进 streaming 循环里最关键的一步:<strong>文本如何被切成 chunk、又如何被 LLM 抽成一条条原子事实</strong>。这里藏着两个看似普通、实则反复"咬过人"的设计——<strong>切块的幂等性</strong>,和<strong>抽取 prompt 与 bank 解耦</strong>。</p>
+
+      <div class="keypoints">
+        <h3>本章要点</h3>
+        <ul>
+          <li>切块 <code>chunk_text</code> 按内容类型分流:纯文本<strong>句子感知</strong>、JSON 对话<strong>轮次边界</strong>、JSONL <strong>行边界</strong>。</li>
+          <li>切块必须<strong>幂等</strong>(对结果再切一次不变),否则 streaming 的"先预切、抽取时再切一次"会让子块撞 <code>chunk_id</code>(issue #2301)。</li>
+          <li>一条"事实"是多维的:<code>what/when/where/who/why</code> + <code>fact_type</code> + <code>entities</code> + <code>causal_relations</code>,最终拼成一句 <code>fact_text</code>。</li>
+          <li>抽取 prompt 的 <strong>system 部分刻意与 bank 无关</strong>(mission 放进 user message),只为<strong>跨 bank 共享 LLM 缓存</strong>。</li>
+          <li><code>chunks</code> 模式是"不调 LLM"的逃生舱:整块当一条事实。</li>
+        </ul>
+      </div>
+
+      <h2 id="two">1. 两个子问题:怎么切、怎么抽</h2>
+      <p>Retain 的"抽 + 嵌"发生在 <code>engine/retain/fact_extraction.py</code>(约 2800 行,是本包最大的文件之一,同样建议按函数跳读)。它解决两个子问题:</p>
+      <ul>
+        <li><strong>切块(chunking)</strong>:把可能很大的输入文本,切成适合喂给 LLM 的小块。入口 <code>chunk_text</code>。</li>
+        <li><strong>抽事实(extraction)</strong>:把每个小块交给 LLM,抽出一条条结构化事实。入口 <code>extract_facts_from_contents</code>(并行处理多个 content)。</li>
+      </ul>
+
+      <h2 id="chunk">2. 切块:<code>chunk_text</code></h2>
+      <p class="src-ref"><strong>定位</strong>:<code>engine/retain/fact_extraction.py</code> → <code>chunk_text</code>;分支辅助函数 <code>_chunk_conversation</code>、<code>_chunk_jsonl</code>、<code>_split_oversized_unit</code>。</p>
+      <p>它先判断输入是什么类型,再选不同的切法:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · chunk_text(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = None) -&gt; list[str]:
+    # 文本足够小,直接整块返回
+    if len(text) &lt;= max_chars:
+        return [text]
+
+    structured_limit = structured_chunk_size if structured_chunk_size is not None else max_chars
+
+    # 尝试当成 JSON 对话数组解析([{user...}, {assistant...}, ...])
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+
+    if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
+        # 是对话 —— 按"轮次"边界切,不切断一条发言
+        return _chunk_conversation(parsed, max_chars, structured_limit)
+
+    if isinstance(parsed, dict):
+        # 单个 JSON 对象(可能是已被上游预切的一条 JSONL)—— 尽量保持完整
+        if len(text) &lt;= structured_limit:
+            return [text]
+        return _split_oversized_unit(text, max_chars)
+
+    # 尝试按 JSONL(每行一个 JSON 对象,如会话日志)切
+    jsonl_chunks = _chunk_jsonl(text, max_chars, structured_limit)
+    if jsonl_chunks is not None:
+        return jsonl_chunks
+
+    # 兜底:句子感知的纯文本切分
+    return _split_oversized_unit(text, max_chars)</code></pre>
+      </div>
+      <p>行为要点:</p>
+      <ul>
+        <li><strong>纯文本</strong>:句子感知切分(尽量在句号等边界切,不从句子中间砍断)。</li>
+        <li><strong>JSON 对话数组</strong>:在<strong>轮次边界</strong>切,不会把一条发言切成两半。</li>
+        <li><strong>JSONL</strong>:在<strong>行边界</strong>切,一行一个对象不被切断。</li>
+        <li>单条发言/单行若超过 <code>max_chars</code>,最多保持到 <code>structured_chunk_size</code>,再大就按文本切。</li>
+      </ul>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ 幂等性:这里最重要的不变量(issue #2301)</p>
+        <p><code>chunk_text</code> 的 docstring 明确写道:<strong>"结果是幂等的:对返回的任何一个 chunk 再次切块,得到的还是它本身。"</strong>为什么必须如此?因为 streaming 流水线会<strong>先整篇预切一次,抽取阶段对每一片再切一次</strong>。如果第二次会把某片再切开,那么这些子块会<strong>继承同一个 <code>chunk_index</code></strong>,而 <code>chunk_id = {bank}_{doc}_{chunk_index}</code> 是确定性主键——于是冲突、数据错乱。上面 <code>isinstance(parsed, dict)</code> 那一分支,就是专门为了堵住"一个已被上游保持完整的对象,落到纯文本切分里又被切碎"这个破坏幂等的漏洞。</p>
+      </div>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ 一个通用的工程教训</p>
+        <p>"同一个函数会被流水线在<strong>不同阶段重复调用</strong>"时,务必让它<strong>幂等</strong>。否则第二次调用的副作用(这里是再切一刀)会悄悄破坏第一次调用建立的不变量。这类 bug 极难复现,往往只在特定长度的输入上偶发。</p>
+      </div>
+
+      <p>切完后,编排器会<strong>清空 <code>RetainContent.content</code> 这个大字符串</strong>,只留 <code>all_pre_chunks</code> 工作集——纯粹为了内存(大文档可达数 MB × N 份)。</p>
+
+      <h2 id="fact-shape">3. 一条"事实"长什么样</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>fact_extraction.py</code> → <code>ExtractedFact</code>(默认模式的 Pydantic schema)。</p>
+      <p>LLM 被要求对每条事实输出多个维度,而不是一句话:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · ExtractedFact(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">class ExtractedFact(BaseModel):
+    what: str = Field(description="Core fact - concise but complete (1-2 sentences)")
+    when: str = Field(description="When it happened. 'N/A' if unknown.")
+    where: str = Field(description="Location if relevant. 'N/A' if none.")
+    who: str = Field(description="People involved with relationships. 'N/A' if general.")
+    why: str = Field(description="Context/significance if important. 'N/A' if obvious.")
+
+    fact_kind: str = Field(default="conversation", description="'event' or 'conversation'")
+    occurred_start: str | None = Field(default=None, description="ISO timestamp for events")
+    occurred_end: str | None = Field(default=None, description="ISO timestamp for event end")
+    fact_type: Literal["world", "assistant"] = Field(
+        description="'world' = objective/external facts, including user preferences, rules...; "
+                    "'assistant' = actions/experiences the assistant/agent actually performed.")
+    entities: list[str] = Field(default_factory=list,
+        description='People, places, concepts - plain strings, e.g. ["Alice", "Kubernetes"]')
+    causal_relations: list[FactCausalRelation] | None = Field(
+        default=None, description="Links to previous facts (target_index &lt; this fact's index)")
+
+    def build_fact_text(self) -&gt; str:
+        parts = [self.what]
+        if self.who and self.who.upper() != "N/A":
+            parts.append(f"Involving: {self.who}")
+        if self.why and self.why.upper() != "N/A":
+            parts.append(self.why)
+        return " | ".join(parts) if len(parts) &gt; 1 else parts[0]</code></pre>
+      </div>
+
+      <div class="callout concept">
+        <p class="callout-title">📖 fact_type 的"方言":world/assistant → world/experience</p>
+        <p>注意 LLM 抽取时输出的 <code>fact_type</code> 是 <code>"world"</code> 或 <code>"assistant"</code>;而第 01 章讲数据库里存的是 <code>world</code> / <code>experience</code>。这是<strong>同一个概念的两种叫法</strong>:prompt 里用"assistant"更贴合模型对"第一人称是我(Agent)"的理解,落库时被映射成更通用的 <code>experience</code>。读代码时看到这两个词别以为是两回事。</p>
+      </div>
+
+      <ul>
+        <li><strong><code>entities</code> 是纯字符串列表</strong>(如 <code>["Alice", "Kubernetes"]</code>),甚至包括"友谊""职业成长"这类抽象概念。这些字符串会在下一章被<strong>归一</strong>成规范实体——抽取层只管"提到过什么",不管"它和已有实体是不是同一个"。</li>
+        <li><strong><code>causal_relations</code> 只能指向<strong>之前</strong>的事实</strong>(<code>target_index &lt; this fact's index</code>,每条最多 2 个)。这是因果边的来源,第 05 章会看到它如何变成 <code>caused_by</code> 边。用"批内序号"而非 ID 来引用,是因为此时事实还没落库、没有真实 ID。</li>
+        <li><strong><code>build_fact_text()</code></strong> 把多维信息拼成<strong>一条</strong>字符串(<code>what | Involving: who | why</code>),这才是真正存进 <code>memory_units.text</code>、被 embed、被检索的内容。</li>
+      </ul>
+
+      <h2 id="prompt">4. Prompt 设计:为什么 system 部分与 bank 无关</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>fact_extraction.py</code> → <code>_build_extraction_prompt_and_schema</code>(组装 system prompt + 选 schema);<code>_build_user_message</code>(组装每次请求的 user message)。</p>
+
+      <h3 id="modes">抽取模式(extraction modes)</h3>
+      <p>配置项 <code>retain_extraction_mode</code> 决定用哪套 prompt 与 schema:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>模式</th><th>行为</th><th>何时用</th></tr></thead>
+          <tbody>
+            <tr><td><code>concise</code>(默认)</td><td>抽成简洁的多维事实</td><td>常规</td></tr>
+            <tr><td><code>verbose</code></td><td>更啰嗦的事实(用 <code>ExtractedFactVerbose</code> schema)</td><td>需要更丰富细节</td></tr>
+            <tr><td><code>verbatim</code></td><td>尽量逐字保留原文,不建因果边</td><td>不想让模型改写</td></tr>
+            <tr><td><code>custom</code></td><td>注入 <code>retain_custom_instructions</code> 自定义指令</td><td>领域定制</td></tr>
+            <tr><td><code>chunks</code></td><td><strong>不调 LLM</strong>,整块当一条事实(见第 5 节)</td><td>provider=none / 速度成本优先</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="cache">关键设计:system prompt 刻意"与 bank 无关"</h3>
+      <p>这是本章最值得记住的设计决策。直觉上,bank 的 <code>retain_mission</code>("这个记忆库关注什么")似乎该写进 system prompt。但源码<strong>故意不这么做</strong>:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · _build_extraction_prompt_and_schema(注释)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># The per-bank retain mission is NOT baked into this system prompt: it would
+# make the prompt bank-specific and force a separate Gemini context cache per
+# mission (one per bank). Instead the prompt is bank-agnostic so a single
+# CachedContent serves every bank, and the mission rides in the per-request
+# user message via _retain_mission_preamble().</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 为什么?为了跨 bank 共享缓存、省钱</p>
+        <p>Gemini(以及 Anthropic、OpenAI)支持<strong>prompt 前缀缓存</strong>:相同的前缀可以只付一次全价,后续命中缓存便宜很多。如果把 mission 写进 system prompt,那么<strong>每个 bank 的 system prompt 都不一样</strong>,就得为每个 bank 单独建一份缓存——成千上万个 bank 就是成千上万份缓存,缓存命中率暴跌。把"对所有 bank 都一样"的部分(抽取规则、输入格式、输出格式)放进可缓存的 system,把"每个 bank 不同"的 mission 放进每次请求的 user message,就能让<strong>一份缓存服务所有 bank</strong>。这是一个"为成本而调整 prompt 结构"的典型例子。</p>
+      </div>
+
+      <h3 id="narrator">第一人称归属:Narrator 与 Context 的优先级</h3>
+      <p>抽取时还要解决"我"是谁的问题。<code>_build_user_message</code> 会注入一段 Narrator 说明,并且明确 <strong>Context 优先</strong>:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · _build_user_message(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">if agent_name:
+    narrator_section = (
+        f"\nNarrator: {agent_name} (the AI agent whose memory this is). By default, "
+        f'first-person statements like "I did X" are {agent_name}\'s own actions → classify as '
+        f'"assistant".'
+    )
+    if context:
+        narrator_section += (
+            " BUT the Context above takes precedence: if it identifies a different "
+            "first-person speaker (e.g. a user or customer in a transcript), attribute those "
+            'statements to that speaker and classify them as "world", not "assistant".'
+        )</code></pre>
+      </div>
+      <p>含义:默认情况下"我做了 X"是 Agent 自己的行为 → 归为 <code>assistant</code>(即 experience);但如果 Context 表明说话的是用户/客户,那么"我"指用户 → 归为 <code>world</code>。这决定了这条记忆是"我的经历"还是"关于世界(用户)的事实"。</p>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ 顺带一提:输出语言与检索语言是两回事</p>
+        <p>prompt 末尾还会追加一条"强制用配置语言输出事实"的指令(<code>llm_output_language</code>)。源码注释专门强调:这和 BM25 的索引语言(<code>text_search_extension_native_language</code>)<strong>是相互独立的两个配置</strong>——"LLM 输出什么语言"和"全文检索按什么语言分词"是不同关注点,别混。</p>
+      </div>
+
+      <h2 id="chunks-mode">5. <code>chunks</code> 模式:不调 LLM 的逃生舱</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>fact_extraction.py</code> → <code>_extract_facts_chunks</code>。</p>
+      <p>当不需要(或不能)调 LLM 时,系统走 <code>chunks</code> 模式:每个 chunk 直接成为一条 <code>world</code> 事实,原文即 <code>fact_text</code>,<strong>不抽实体</strong>。</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · _extract_facts_chunks(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># chunks mode: no LLM call, no entity extraction.
+# Each chunk becomes one memory unit with the raw text as fact_text.
+for chunk in chunks:
+    extracted_facts.append(ExtractedFactType(
+        fact_text=chunk,
+        fact_type="world",
+        entities=[],          # 本模式不抽实体
+        content_index=content_index,
+        chunk_index=global_chunk_idx,
+        ...
+    ))</code></pre>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 什么时候会被强制走 chunks?</p>
+        <p>把 <code>HINDSIGHT_API_LLM_PROVIDER</code> 设为 <code>none</code> 时,配置校验会<strong>强制</strong> <code>retain_extraction_mode="chunks"</code> 并关闭 observations——逻辑是:没有模型,就别假装能抽事实,老老实实做"只能向量检索"的朴素记忆。这也让"无 LLM"成为一个可运行、可演示的降级形态。</p>
+      </div>
+
+      <h2 id="failure">6. 失败处理:必须响亮,但也要能容错</h2>
+      <ul>
+        <li><strong>该失败就失败</strong>:重试耗尽、协议异常等必须 <code>raise</code>(issue #1833),绝不能返回空列表还标成功——那会静默丢记忆(第 03 章已强调)。</li>
+        <li><strong>输出过长会自动切分重试</strong>:如果模型说"输出太长"(<code>OutputTooLongError</code>),<code>_extract_facts_with_auto_split</code> 会把这个 chunk 一分为二再分别抽,而不是直接放弃。</li>
+        <li><strong>瞬时错误可重试</strong>:偶发的 JSON 解析失败、连接错误等走重试;但像"embedding 维度不匹配"这种<strong>确定性错误不重试</strong>(重试只是白白烧 worker 槽位)。</li>
+      </ul>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ 两个同名函数,别混</p>
+        <p><code>embedding_processing.py</code> 和 <code>embedding_utils.py</code> 里各有一个 <code>generate_embeddings_batch</code>——前者是<strong>包装</strong>,后者是<strong>实现</strong>。import 时看准路径。</p>
+      </div>
+
+      <div class="summary">
+        <h2>小结</h2>
+        <ul>
+          <li><code>chunk_text</code> 按类型分流(文本/对话/JSONL),核心不变量是<strong>幂等</strong>(issue #2301)。</li>
+          <li>一条事实是多维的(<code>what/when/where/who/why + fact_type + entities + causal_relations</code>),最终拼成单条 <code>fact_text</code>。</li>
+          <li><code>fact_type</code> 抽取时叫 <code>world/assistant</code>,落库叫 <code>world/experience</code>。</li>
+          <li>抽取 <strong>system prompt 与 bank 解耦</strong>,mission 放进 user message,为的是<strong>跨 bank 共享 LLM 缓存</strong>。</li>
+          <li><code>chunks</code> 模式是无 LLM 的逃生舱;失败处理遵循"该响亮就响亮、该容错就容错"。</li>
+        </ul>
+        <p>下一章,我们看抽出来的实体如何被<strong>归一</strong>,事实之间如何建起<strong>时序 / 语义 / 因果</strong>三种边,以及那个为"既不让慢操作持锁、又保证检索数据原子可见"而设计的 <strong>Phase1 / Phase2 / Phase3</strong> 事务划分。</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="assets/js/mermaid.min.js"></script>
+  <script src="assets/js/highlight.min.js"></script>
+  <script src="assets/js/course.js"></script>
+</body>
+</html>

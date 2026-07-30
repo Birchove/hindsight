@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>09 · 巩固:从事实到观察 — Hindsight 源码精读</title>
+  <link rel="stylesheet" href="assets/css/course.css">
+  <link rel="stylesheet" href="assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="目录">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">第四部分 · 推理与巩固</p>
+      <h1>09 · 巩固:从事实到观察</h1>
+      <p class="lead">Hindsight 宣称自己"会学习,不只是记得"。这份"学习"就发生在<strong>巩固(consolidation)</strong>:一个在 Retain 之后异步运行的后台 job,把零散的 world/experience 事实<strong>合成、更新</strong>成 observation。这一章讲它怎么运作、为什么不能在 Retain 里顺手做、以及为什么它对"标签"近乎偏执。</p>
+
+      <div class="keypoints">
+        <h3>本章要点</h3>
+        <ul>
+          <li>巩固是<strong>自底向上的"学习"</strong>:facts → observation(<code>memory_units</code> 里 <code>fact_type='observation'</code> 的行)。它<strong>不是</strong> <code>mental_models</code> 表(后者是用户定义、按需刷新的)。</li>
+          <li>与 Retain <strong>解耦</strong>:Retain 流式按块提交,进行的途中没有"全文事实全集";巩固又贵;解耦后还可崩溃续跑。</li>
+          <li>工作队列就是一个 SQL 谓词:<code>consolidated_at IS NULL AND fact_type IN ('experience','world')</code>。</li>
+          <li>核心策略:<strong>优先 UPDATE 而非 CREATE</strong>(一个 observation 挂多条证据 &gt; 一堆各挂一条的孪生);<strong>标签是安全边界</strong>,不同标签的事实绝不共享一次 LLM 调用。</li>
+          <li>source 变了就<strong>删 observation + 重置 <code>consolidated_at</code></strong>,让事实在下一轮重新巩固。</li>
+        </ul>
+      </div>
+
+      <h2 id="what">1. 巩固做什么,为什么和 Retain 分开</h2>
+      <p>Retain 是<strong>记录</strong>流水线:抽事实、落库,并在每条事实上盖一个 <code>observation_scopes</code> 指令,但<strong>不合成任何东西</strong>。巩固是单独的<strong>学习</strong>流水线:读一批未巩固的事实,产出/更新 observation 行(带 <code>proof_count</code> 支撑数、<code>source_memory_ids</code> 证据集、<code>history</code> 变更历史)。</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/consolidation/consolidator.py · 模块 docstring</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># NOTE: Observations are distinct from mental models (pinned reflections).
+# - Observations: auto-generated bottom-up by this engine from raw facts
+#   (memory_units table, fact_type='observation')
+# - Mental models: user-defined queries stored in the mental_models table,
+#   refreshed on demand via reflect</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 为什么不在 Retain 里顺手巩固?</p>
+        <p><strong>(1) 没有全集</strong>:Retain 流式按块提交,进行到一半时根本没有"这篇文档的全部事实",而观察需要跨块、跨文档聚合。<strong>(2) 成本</strong>:巩固是 LLM 重活(召回 + 合成 + 可选去重裁决),塞进 Retain 会让写入延迟和综合强耦合;独立出来可以在 worker 池里用自己的并发预算、还能用"与 bank 无关的可缓存 prompt 前缀"省钱。<strong>(3) 可重跑</strong>:进度按事实标记(<code>consolidated_at</code>),失败隔离(<code>consolidation_failed_at</code>),崩了/跑一半都能接着来。</p>
+      </div>
+
+      <h2 id="scopes">2. observation_scopes:按什么粒度巩固</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>consolidator.py</code> → <code>_resolve_obs_tags_list</code>。</p>
+      <p>Retain 时每条内容可带一个 <code>observation_scopes</code>,决定"把这些事实按什么标签范围聚成观察":</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>取值</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td><code>combined</code>(默认/None)</td><td>用该事实的<strong>完整标签集</strong>作为一个范围,做一次巩固</td></tr>
+            <tr><td><code>per_tag</code></td><td><strong>每个标签一次</strong>:标签 <code>[a,b]</code> 分别进范围 <code>{a}</code> 和 <code>{b}</code></td></tr>
+            <tr><td><code>all_combinations</code></td><td>标签的每个非空子集各一次:<code>{a}</code>、<code>{b}</code>、<code>{a,b}</code></td></tr>
+            <tr><td><code>shared</code></td><td>只对<strong>空范围</strong>做一次:产出的 observation <strong>不带标签</strong>,用 <code>tags_match="any"</code> 匹配——所有事实聚成一个全局观察(用于跨"易变来源标签"去重)</td></tr>
+            <tr><td>显式 <code>list[list[str]]</code></td><td>每个内层标签列表一次,完全自定义</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/consolidation/consolidator.py · _resolve_obs_tags_list(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">parsed = _parse_observation_scopes(memory)
+tags = list(memory.get("tags") or [])
+if parsed == "per_tag":
+    return [[t] for t in tags] if tags else None
+if parsed == "all_combinations":
+    return [list(c) for r in range(1, len(tags)+1) for c in combinations(tags, r)] if tags else None
+if parsed == "shared":
+    return [[]]                      # 一个空范围
+if parsed == "combined" or parsed is None:
+    return None                      # 默认:用事实自己的标签
+return parsed                        # 显式 list[list[str]]</code></pre>
+      </div>
+      <p>还有个 <code>_resolve_write_scopes</code> 把范围转成 <code>frozenset</code>,让<strong>并行调度器能按范围加锁</strong>:两个标签组若写范围有交集,就在共享范围上串行(防止抢同一行 observation);不相交的组并发跑。加锁顺序是一个全序,专门为了<strong>无死锁</strong>。</p>
+
+      <h2 id="job">3. 巩固 job 的流程</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>consolidator.py</code> → <code>run_consolidation_job</code> / <code>_run_consolidation_job</code> / <code>_process_memory_batch</code>。</p>
+      <div class="diagram">
+        <div class="mermaid">
+flowchart TB
+  A["工作队列:SQL 谓词<br/>consolidated_at IS NULL<br/>AND fact_type IN (experience,world)"] --> B[取一批]
+  B --> C["按<strong>精确标签集</strong>分组<br/>(安全:不同标签绝不共享 LLM 调用)"]
+  C --> D[切成 LLM 批]
+  D --> E["每批:_process_memory_batch"]
+  E --> E1["① 每条事实并行 recall 相关 observation"]
+  E1 --> E2["② 跨批并集去重(按 id)"]
+  E2 --> E3["③ 一次 LLM 调用:N 条事实 + 并集 observation"]
+  E3 --> E4["④ 顺序执行动作<br/>先 delete,再 update,再 create"]
+  E4 --> F["标记 consolidated_at=NOW()<br/>失败标记 consolidation_failed_at"]
+  F --> B
+        </div>
+        <div class="diagram-caption">图 9-1:巩固 job 的核心循环。"按精确标签集分组"被源码称为安全要求。</div>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/consolidation/consolidator.py · 取批与分组(节选)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">memories = await conn.fetch(f"""
+    SELECT id, text, fact_type, ..., observation_scopes
+    FROM memory_units
+    WHERE bank_id = $1
+      AND consolidated_at IS NULL
+      AND consolidation_failed_at IS NULL
+      AND fact_type IN ('experience', 'world')
+    ORDER BY created_at ASC
+    LIMIT ${limit_idx}""", *fetch_params)
+if not memories:
+    break
+
+# 按精确标签集分组 —— 安全要求:不同标签的事实绝不能共享一次 LLM 调用。
+tag_groups: dict[tuple[str, ...], list[dict]] = {}
+for m in memories:
+    tag_key = tuple(sorted(m.get("tags") or []))
+    tag_groups.setdefault(tag_key, []).append(dict(m))</code></pre>
+      </div>
+      <p>每个 LLM 批内部:<strong>① 每条事实并行召回相关 observation</strong>(就是复用 recall,但限定 <code>fact_type=["observation"]</code>、<code>tags_match="all_strict"</code>、<code>reranking="interleave"</code>);② 跨批并集去重;③ <strong>一次 LLM 调用</strong>处理 N 条事实 + 这些 observation;④ <strong>顺序</strong>执行写动作(写要串行保一致)。执行顺序是<strong>先 delete</strong>(腾出 observation 名额)再 update 再 create。失败处理用<strong>自适应二分</strong>:一批失败就劈成两半重试,一直劈到单条;只有单条失败才盖 <code>consolidation_failed_at</code>。</p>
+
+      <h2 id="prompt">4. Prompt:一个"防模型犯蠢"的样板</h2>
+      <p class="src-ref"><strong>定位</strong>:<code>consolidation/prompts.py</code>。</p>
+      <p>prompt 分成"<strong>与 bank 无关、可缓存的 system 前缀</strong>"和"每批的 user 消息"——和第 04 章抽取 prompt 是同一个省钱思路:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/consolidation/prompts.py · build_consolidation_system_prompt(注释)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># Holds only what is constant across banks: processing rules, input format,
+# decision guide, and output format. The bank's MISSION is deliberately NOT
+# here — baking it in would make the prefix bank-specific and force a separate
+# Gemini context cache per mission. ... so this prefix is identical for every
+# bank and a single CachedContent serves them all.</code></pre>
+      </div>
+      <p>处理规则里几条尤其值得记(都是模型容易犯错的地方):</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>规则</th><th>原文要旨</th></tr></thead>
+          <tbody>
+            <tr><td><strong>优先 UPDATE 而非 CREATE</strong></td><td>若新事实描述的是已有 observation 覆盖的同一规范事件/论断,<strong>更新它、把新事实挂为证据,不要建近重复的兄弟</strong>。"一个挂多条证据的规范 observation,永远好过一堆各挂一条的兄弟。"</td></tr>
+            <tr><td>一个 facet 一个 observation</td><td>一个计数、一个实体、一个关系——绝不混并。</td></tr>
+            <tr><td>状态变化要更新</td><td>"卖了 X""X 死了""搬到 Y" → 更新匹配的 observation 反映当前状态。</td></tr>
+            <tr><td>保留历史</td><td>记录重大事件的 observation 是重要历史,<strong>绝不删除</strong>;删除要极其保守。</td></tr>
+            <tr><td><strong>禁止计算</strong></td><td>"你没有全貌——绝不计算、推导、调整数值。用户说'我有 2 条狗'又说'我有条叫 Rex 的狗',<strong>别</strong>把数改成 3——你不知道 Rex 是不是那 2 条之一。"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>输出是 <code>{"creates":[...], "updates":[...], "deletes":[...]}</code>,每个动作都要带 <code>reason</code>("CREATE 要说明考虑过哪些已有 observation、为何都不匹配——这会被审计以抓重复创建")。而且<strong>每个 <code>observation_id</code> 至多一个 UPDATE</strong>(多个会互相覆盖)。</p>
+      <div class="callout why">
+        <p class="callout-title">💡 模型不可信,所以层层设防</p>
+        <p>LLM 之后还有好几道确定性防线:<code>_dedupe_updates</code> 把同一 <code>observation_id</code> 的多个 update 合并;<strong>精确文本守卫</strong>丢掉"和上下文里已有 observation 一字不差"的 CREATE(因为"模型时不时就会这么干");可选的<strong>语义去重</strong>(阈值 <1.0 时)对每个 CREATE/UPDATE 探测 top-5 邻居,再用一次<strong>聚焦的 LLM 调用</strong>裁决"合并还是保留"。</p>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 为什么巩固专用 interleave 重排?</p>
+        <p>巩固召回 observation 时用 <code>reranking="interleave"</code>(第 08 章讲过)。原因被实测写在注释里:cross-encoder 会把那条"几乎一样的孪生 observation"从语义第 1 打到重排第 37,RRF 也会把它挤出 512-token 预算——结果模型看不见它,又建了个重复的。interleave 保证每路 top 都有位置,孪生总能被看见,于是模型去 UPDATE 而非 CREATE。</p>
+      </div>
+
+      <h2 id="update">5. 更新 vs 重建,以及失效</h2>
+      <p><strong>UPDATE 就地改写</strong>observation 的文本与 embedding、扩展证据、合并字段——绝不从头重建。注意两点:<strong>标签是"并"不是"替"</strong>(每个贡献者都能继续看见它);时间字段聚合(最早 start、最晚 end、最晚 mentioned)。每次 update 先把旧状态快照进 <code>observation_history</code> 表,<strong>限行数</strong>——因为曾用单 JSONB 列存历史,一条被反复强化的 observation 把它撑过 PostgreSQL 的 256MB jsonb 上限而卡死。</p>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ 失效 = 删 observation + 重置 consolidated_at</p>
+        <p>当底层事实被删/被替换(文档重灌、删记忆、改标签、清空观察),<code>delete_stale_observations_for_memories</code> 会:① <strong>删掉</strong>引用了这些事实的 observation(哪怕只少了一个来源,它的文本就过时了);② 把<strong>幸存</strong>的来源事实 <code>consolidated_at</code> 重置为 NULL,让它们<strong>下一轮重新巩固</strong>。这就是系统的"再巩固"机制:删 + 重置 = 把事实放回工作队列。反向的竞态(巩固到一半源事实被删)由 <code>_filter_live_source_memories</code> 在每次写之前 <code>FOR SHARE</code> 复检源 id 来堵上。</p>
+      </div>
+
+      <h2 id="trigger">6. 触发与调度</h2>
+      <ul>
+        <li><strong>Retain 后自动</strong>:每条事实落库后调 <code>_submit_post_insert_maintenance</code>,受 bank 配置 <code>enable_observations</code> + <code>enable_auto_consolidation</code> 门控。失败只记日志、<strong>绝不上抛</strong>——巩固不能搞砸一次 retain。</li>
+        <li><strong>bank 级去重</strong>:提交时若已有该 bank 的"未限定范围 pending"操作,就复用原 <code>operation_id</code>,不重复排队(去重只看 <code>pending</code>,不看 <code>processing</code>——处理中的任务用的是它启动时的水位线,之后新增的事实仍需新一轮)。</li>
+        <li><strong>worker 领取</strong>:独立 worker 进程每 500ms 轮询 <code>async_operations</code>,且<strong>给巩固预留槽位</strong>(默认 <code>{"consolidation": 2}</code>),保证巩固有算力又不饿死 retain。</li>
+        <li><strong>手动 / 维护</strong>:<code>POST /banks/{id}/consolidate</code>、清空某记忆的 observations、维护对账扫 backlog。</li>
+        <li><strong>自我重排</strong>:一轮撞到预算上限就重新入队——这个失败<strong>必须上抛</strong>,否则"bank 有 backlog 却没排上的活——悄悄卡死"。</li>
+        <li><strong>下游</strong>:一轮最终完成后,给标签匹配、且设了 <code>refresh_after_consolidation</code> 的<strong>用户 mental model</strong> 提交刷新任务。</li>
+      </ul>
+
+      <h2 id="gotchas">7. 设计决策与易踩坑</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>点</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>标签是安全边界,不是提示</td><td>不同标签的事实绝不共享 LLM 调用;召回用 <code>all_strict</code>;写前再按事实复检召回集——防跨租户/跨用户泄漏</td></tr>
+            <tr><td>可见性由算法决定,模型说了不算</td><td>标签是算法继承/合并的;prompt 明确"不要输出 tags"</td></tr>
+            <tr><td>只巩固 world/experience</td><td>observation 之间<strong>不互相</strong>巩固;单条失败被标记后不再自动跑(有手动 recover)</td></tr>
+            <tr><td><code>total_count</code> 只是时点估计</td><td>运行中新写入的会被捞起,<code>processed</code> 可能超过它</td></tr>
+            <tr><td>语义去重仅 PG</td><td>用了 <code>unnest</code>/<code>array_agg</code>/<code>UPDATE...FROM</code>;Oracle 跳过,改用 <code>observation_sources</code> 连接表</td></tr>
+            <tr><td><code>shared</code> 范围无标签、全局可见</td><td>用错就是跨标签泄漏;文档把它定位为"跨来源标签去重"的专用模式</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="summary">
+        <h2>小结</h2>
+        <ul>
+          <li>巩固 = 自底向上的学习:facts → observation(一种特殊事实);与 retain 解耦(无全集、贵、可重跑)。</li>
+          <li>工作队列是 SQL 谓词;按精确标签集分组(安全);每批"并行召回 → 一次 LLM → 顺序写";先删后建。</li>
+          <li>策略核心:<strong>优先 UPDATE</strong>;禁止计算;层层防模型犯蠢;<strong>标签是安全边界</strong>。</li>
+          <li>失效 = 删 observation + 重置 <code>consolidated_at</code> = 再巩固。</li>
+        </ul>
+        <p>下一章看消费侧的"反思":Reflect 如何用一个带工具的 agent 循环,按需取用 observation 与 mental model,生成带性格的回答。</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="assets/js/mermaid.min.js"></script>
+  <script src="assets/js/highlight.min.js"></script>
+  <script src="assets/js/course.js"></script>
+</body>
+</html>
