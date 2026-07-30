@@ -76,7 +76,7 @@ for rrf_rank, (doc_id, rrf_score) in enumerate(
       </ul>
       <div class="callout concept">
         <p class="callout-title">📖 还有个 interleave 模式,专门治 RRF 的一个毛病</p>
-        <p>RRF 用"各路倒数排名之和"打分,于是<strong>一条在某路排第 1、但在别路缺席/很低的结果,会被平均拉低</strong>。这在巩固去重时咬过人:一条与已有 observation 几乎相同的"孪生"结果,语义路排第 1,却被 RRF/重排埋到预算之外,导致模型没看见它、又建了个重复的。<code>interleave_fusion</code> 用<strong>轮询</strong>保证每路的 top 都拿到一个位置(并跳过后续的合并打分重排)。巩固专门用 interleave 就是这个原因(第 09 章)。</p>
+        <p>RRF 用"各路倒数排名之和"打分,于是<strong>一条在某路排第 1、但在别路缺席/很低的结果,会被平均拉低</strong>。这在巩固去重时出过问题:一条与已有 observation 几乎相同的"孪生"结果,语义路排第 1,却被 RRF/重排埋到预算之外,导致模型没看见它、又建了个重复的。<code>interleave_fusion</code> 用<strong>轮询</strong>保证每路的 top 都拿到一个位置(并跳过后续的合并打分重排)。巩固专门用 interleave 就是这个原因(第 09 章)。</p>
       </div>
 
       <h2 id="ce">3. Cross-encoder 重排</h2>

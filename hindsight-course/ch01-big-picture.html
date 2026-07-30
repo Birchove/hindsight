@@ -24,8 +24,8 @@
           <li>Hindsight 不是"把对话历史塞进向量库",而是把文本加工成一张<strong>原子事实网络</strong>(事实 + 实体 + 三种边),再在其上做检索与推理。</li>
           <li>记忆分三类:<strong>world facts / experience facts / mental models(observations)</strong>;前两者由 Retain 写入,第三者由后台巩固生成。</li>
           <li>对外只有三个操作:<strong>Retain(写)、Recall(读)、Reflect(推理)</strong>。</li>
-          <li>代码分三层:<strong>API 适配 → Engine 门面 → 流水线包</strong>;读的时候绝不要跨层找东西,也绝不要整文件读那两个"巨石文件"。</li>
-          <li>全课的复杂度几乎都源自<strong>三组工程张力</strong>,先记住它们。</li>
+          <li>代码分三层:<strong>API 适配 → Engine 门面 → 流水线包</strong>;读的时候绝不要跨层找东西,也绝不要整文件读那两个"超长文件"。</li>
+          <li>全课的复杂度几乎都源自<strong>三组工程权衡</strong>,先记住它们。</li>
         </ul>
       </div>
 
@@ -73,7 +73,7 @@ flowchart TB
 
       <ul>
         <li><strong>① 原子事实(facts)</strong>:一条可以独立成立的断言。分两种——<strong>world fact</strong>(关于世界的客观知识,如"Alice 在 Google 当工程师")和 <strong>experience fact</strong>(Agent 的亲身经历,如"我上次部署忘了跑迁移,出事了")。数据库里它们都是 <code>memory_units</code> 表的一行,用 <code>fact_type</code> 区分。<strong>事实是系统统一的语义基元</strong>——这一点非常关键,后面会反复出现。</li>
-        <li><strong>② 实体与边</strong>:每条事实里提到的实体(人、地点、组织、甚至"友谊""职业成长"这类抽象概念)会被<strong>抽取并归一</strong>——"Google""google inc""谷歌"指向同一个规范实体。事实之间还会建三种边:<strong>时序边</strong>(时间上接近)、<strong>语义边</strong>(向量上相近)、<strong>因果边</strong>(这件事实由那件引起)。这些边是图检索的"米"。</li>
+        <li><strong>② 实体与边</strong>:每条事实里提到的实体(人、地点、组织、甚至"友谊""职业成长"这类抽象概念)会被<strong>抽取并归一</strong>——"Google""google inc""谷歌"指向同一个规范实体。事实之间还会建三种边:<strong>时序边</strong>(时间上接近)、<strong>语义边</strong>(向量上相近)、<strong>因果边</strong>(这件事实由那件引起)。这些边供 Recall 的图检索遍历。</li>
         <li><strong>③ 观察 / 心智模型(observations / mental models)</strong>:从零散事实里<strong>反思、合成</strong>出来的更高层判断,如"用户偏好函数式编程"。它本身也存成一种特殊的事实(<code>fact_type='observation'</code>),带"有多少条证据支撑"(<code>proof_count</code>)和"由哪些事实合成"(<code>source_memory_ids</code>)。</li>
       </ul>
 
@@ -155,8 +155,8 @@ flowchart TB
       </div>
 
       <div class="callout gotcha">
-        <p class="callout-title">⚠️ 两个"巨石文件",禁止整文件阅读</p>
-        <p><code>engine/memory_engine.py</code>(约 <strong>1.4 万行</strong>)和 <code>api/http.py</code>(约 <strong>7.5 千行</strong>)是历史形成的巨石文件。<strong>永远按"函数名"跳进去读,不要从头到尾读。</strong>本课程每次引用它们都会给出具体函数名(如 <code>retain_batch_async</code>、<code>_search_with_retries</code>、<code>api_recall</code>),你在 IDE 里直接跳转即可。真正值得"通读"的是③层里那些职责单一的中小文件。</p>
+        <p class="callout-title">⚠️ 两个"超长文件",禁止整文件阅读</p>
+        <p><code>engine/memory_engine.py</code>(约 <strong>1.4 万行</strong>)和 <code>api/http.py</code>(约 <strong>7.5 千行</strong>)是历史形成的超长文件。<strong>永远按"函数名"跳进去读,不要从头到尾读。</strong>本课程每次引用它们都会给出具体函数名(如 <code>retain_batch_async</code>、<code>_search_with_retries</code>、<code>api_recall</code>),你在 IDE 里直接跳转即可。真正值得"通读"的是③层里那些职责单一的中小文件。</p>
       </div>
 
       <h2 id="repo-map">5. 仓库地图(monorepo)</h2>
@@ -207,12 +207,12 @@ flowchart TB
         <li><strong>disposition(性格)</strong>:每个 bank 可配三个 1–5 的整数特质——<code>skepticism</code>(怀疑度)、<code>literalism</code>(字面度)、<code>empathy</code>(共情度)。它<strong>只影响 Reflect 的语气与判断,完全不影响 Recall</strong>。实现上它只是被序列化进 system prompt 的一行 <code>skepticism=3, literalism=3, empathy=3</code>,具体怎么影响回答交给模型自己体会(第 10 章会看到,这是一种很"软"的机制,和强约束的 directive 形成鲜明对比)。</li>
       </ul>
 
-      <h2 id="tensions">7. 贯穿全课的三组工程张力</h2>
-      <p>最后,也是本章最重要的一节。这个系统看起来"过度复杂"的地方,几乎都能追溯到三组张力。<strong>把它们记牢,后面每遇到一个费解的设计,你大概率能对号入座</strong>:</p>
+      <h2 id="tensions">7. 贯穿全课的三组工程权衡</h2>
+      <p>最后,也是本章最重要的一节。这个系统看起来"过度复杂"的地方,几乎都能追溯到三组权衡。<strong>把它们记牢,后面每遇到一个费解的设计,你大概率能对号入座</strong>:</p>
 
       <div class="table-wrap">
         <table>
-          <thead><tr><th>张力</th><th>直白说</th><th>工程对策(后续章节)</th></tr></thead>
+          <thead><tr><th>权衡</th><th>直白说</th><th>工程对策(后续章节)</th></tr></thead>
           <tbody>
             <tr>
               <td><strong>LLM 慢且贵 ↔ 写入要快、可恢复</strong></td>
@@ -234,8 +234,8 @@ flowchart TB
       </div>
 
       <div class="callout tip">
-        <p class="callout-title">✅ 怎么用这三组张力</p>
-        <p>后面每当你在源码注释里看到 <code>#1875</code>、<code>#2662</code>、<code>#1888</code> 这样的 issue 编号,基本就是某组张力在现实中"咬过人"留下的疤。读这些注释,比读函数体更快理解"为什么要这么写"。本课会在相关处引用这些 issue 编号。</p>
+        <p class="callout-title">✅ 怎么用这三组权衡</p>
+        <p>后面每当你在源码注释里看到 <code>#1875</code>、<code>#2662</code>、<code>#1888</code> 这样的 issue 编号,基本就是这三组权衡曾在真实事故里暴露过的问题。读这些注释,往往比读函数体更快理解"为什么要这么写"。本课会在相关处引用这些 issue 编号。</p>
       </div>
 
       <div class="summary">
@@ -244,8 +244,8 @@ flowchart TB
           <li>Hindsight 的核心命题:把文本加工成<strong>原子事实网络</strong>(事实 + 归一实体 + 时序/语义/因果边),而非存原文块。</li>
           <li>记忆三层:world/experience <strong>facts</strong> → 实体与边 → 巩固出的 <strong>observations</strong>;另有用户自定义的 <strong>mental models</strong>(别混淆)。</li>
           <li>三个操作 <strong>Retain / Recall / Reflect</strong>,加一个后台的 <strong>Consolidation</strong>。</li>
-          <li>代码三层 <strong>API → Engine 门面 → 流水线包</strong>,按层阅读、按函数跳转,远离两个巨石文件的通读。</li>
-          <li>三组张力(慢贵↔快恢复、预计算↔会失败、并发↔一致性)是理解全部复杂度的钥匙。</li>
+          <li>代码三层 <strong>API → Engine 门面 → 流水线包</strong>,按层阅读、按函数跳转,远离两个超长文件的通读。</li>
+          <li>三组权衡(慢贵↔快恢复、预计算↔会失败、并发↔一致性)是理解全部复杂度的关键。</li>
         </ul>
         <p>下一章,我们打开数据库,看看这张"事实网络"在磁盘上<strong>到底长什么样</strong>——这是读懂后续所有 SQL 的地基。</p>
       </div>

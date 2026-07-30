@@ -16,7 +16,7 @@
 
       <p class="eyebrow">第二部分 · 写入 Retain</p>
       <h1>04 · 事实抽取与切块</h1>
-      <p class="lead">上一章我们走完了 Retain 的骨架。这一章钻进 streaming 循环里最关键的一步:<strong>文本如何被切成 chunk、又如何被 LLM 抽成一条条原子事实</strong>。这里藏着两个看似普通、实则反复"咬过人"的设计——<strong>切块的幂等性</strong>,和<strong>抽取 prompt 与 bank 解耦</strong>。</p>
+      <p class="lead">上一章我们走完了 Retain 的骨架。这一章钻进 streaming 循环里最关键的一步:<strong>文本如何被切成 chunk、又如何被 LLM 抽成一条条原子事实</strong>。这里藏着两个看似普通、实则反复出过问题的设计——<strong>切块的幂等性</strong>,和<strong>抽取 prompt 与 bank 解耦</strong>。</p>
 
       <div class="keypoints">
         <h3>本章要点</h3>
@@ -25,7 +25,7 @@
           <li>切块必须<strong>幂等</strong>(对结果再切一次不变),否则 streaming 的"先预切、抽取时再切一次"会让子块撞 <code>chunk_id</code>(issue #2301)。</li>
           <li>一条"事实"是多维的:<code>what/when/where/who/why</code> + <code>fact_type</code> + <code>entities</code> + <code>causal_relations</code>,最终拼成一句 <code>fact_text</code>。</li>
           <li>抽取 prompt 的 <strong>system 部分刻意与 bank 无关</strong>(mission 放进 user message),只为<strong>跨 bank 共享 LLM 缓存</strong>。</li>
-          <li><code>chunks</code> 模式是"不调 LLM"的逃生舱:整块当一条事实。</li>
+          <li><code>chunks</code> 模式是"不调 LLM"的兜底方案:整块当一条事实。</li>
         </ul>
       </div>
 
@@ -192,7 +192,7 @@
         <p>prompt 末尾还会追加一条"强制用配置语言输出事实"的指令(<code>llm_output_language</code>)。源码注释专门强调:这和 BM25 的索引语言(<code>text_search_extension_native_language</code>)<strong>是相互独立的两个配置</strong>——"LLM 输出什么语言"和"全文检索按什么语言分词"是不同关注点,别混。</p>
       </div>
 
-      <h2 id="chunks-mode">5. <code>chunks</code> 模式:不调 LLM 的逃生舱</h2>
+      <h2 id="chunks-mode">5. <code>chunks</code> 模式:不调 LLM 的兜底方案</h2>
       <p class="src-ref"><strong>定位</strong>:<code>fact_extraction.py</code> → <code>_extract_facts_chunks</code>。</p>
       <p>当不需要(或不能)调 LLM 时,系统走 <code>chunks</code> 模式:每个 chunk 直接成为一条 <code>world</code> 事实,原文即 <code>fact_text</code>,<strong>不抽实体</strong>。</p>
       <div class="code-block">
@@ -233,7 +233,7 @@ for chunk in chunks:
           <li>一条事实是多维的(<code>what/when/where/who/why + fact_type + entities + causal_relations</code>),最终拼成单条 <code>fact_text</code>。</li>
           <li><code>fact_type</code> 抽取时叫 <code>world/assistant</code>,落库叫 <code>world/experience</code>。</li>
           <li>抽取 <strong>system prompt 与 bank 解耦</strong>,mission 放进 user message,为的是<strong>跨 bank 共享 LLM 缓存</strong>。</li>
-          <li><code>chunks</code> 模式是无 LLM 的逃生舱;失败处理遵循"该响亮就响亮、该容错就容错"。</li>
+          <li><code>chunks</code> 模式是无 LLM 的兜底方案;失败处理遵循"该响亮就响亮、该容错就容错"。</li>
         </ul>
         <p>下一章,我们看抽出来的实体如何被<strong>归一</strong>,事实之间如何建起<strong>时序 / 语义 / 因果</strong>三种边,以及那个为"既不让慢操作持锁、又保证检索数据原子可见"而设计的 <strong>Phase1 / Phase2 / Phase3</strong> 事务划分。</p>
       </div>

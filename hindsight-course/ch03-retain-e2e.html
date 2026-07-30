@@ -30,8 +30,8 @@
       </div>
 
       <div class="callout why">
-        <p class="callout-title">💡 复杂度几乎全来自三组张力</p>
-        <p>回顾第 01 章的三组张力,Retain 是它们最集中的体现:<strong>LLM 慢且贵 ↔ 写入要快、可恢复</strong>(→ streaming、delta、async);<strong>检索需要预计算结构 ↔ 结构计算可能失败</strong>(→ Phase1/2/3);<strong>并发多租户 ↔ 文档级一致性</strong>(→ content_hash、FOR UPDATE、同文档顺序切片)。带着它们读本章会顺很多。</p>
+        <p class="callout-title">💡 复杂度几乎全来自三组权衡</p>
+        <p>回顾第 01 章的三组权衡,Retain 是它们最集中的体现:<strong>LLM 慢且贵 ↔ 写入要快、可恢复</strong>(→ streaming、delta、async);<strong>检索需要预计算结构 ↔ 结构计算可能失败</strong>(→ Phase1/2/3);<strong>并发多租户 ↔ 文档级一致性</strong>(→ content_hash、FOR UPDATE、同文档顺序切片)。带着它们读本章会顺很多。</p>
       </div>
 
       <h2 id="seq">1. 一次请求的全程时序</h2>
@@ -99,7 +99,7 @@ sequenceDiagram
 
       <div class="callout why">
         <p class="callout-title">💡 为什么 Engine 这么"厚"?</p>
-        <p>安全、计费、配置层级、异步入队这些横切关注点集中在一处,业务流水线(<code>retain/</code>)才能保持纯粹。代价就是 <code>memory_engine.py</code> 这个 1.4 万行的巨石——所以它<strong>只能按函数跳读</strong>,不要试图通读。</p>
+        <p>安全、计费、配置层级、异步入队这些横切关注点集中在一处,业务流水线(<code>retain/</code>)才能保持纯粹。代价就是 <code>memory_engine.py</code> 这个 1.4 万行的超长文件——所以它<strong>只能按函数跳读</strong>,不要试图通读。</p>
       </div>
 
       <h2 id="l3">4. 第三层:orchestrator 的文档级骨架</h2>

@@ -256,7 +256,8 @@ blockquote {
   overflow-x: auto;
 }
 html[data-theme="dark"] .diagram { background: #fbfbfa; border-color: #d9d5cb; }
-.diagram .mermaid { font-size: 15px; }
+.diagram .mermaid { font-size: 15px; display: flex; justify-content: center; }
+.diagram .mermaid svg { max-width: 100%; height: auto; display: block; }
 .diagram-caption {
   font-size: 13px; color: var(--text-muted);
   margin-top: 8px; text-align: center; font-style: italic;

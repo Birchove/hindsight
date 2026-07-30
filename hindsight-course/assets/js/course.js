@@ -154,36 +154,51 @@ function initCode() {
   }
 }
 
-function initMermaid() {
+async function initMermaid() {
   if (!window.mermaid) return;
   try {
     window.mermaid.initialize({
       startOnLoad: false,
       theme: "default",
       securityLevel: "loose",
-      flowchart: { htmlLabels: true, curve: "basis" },
-      sequence: { useMaxWidth: true },
+      // useMaxWidth:false so the SVG keeps its true size; we scale it to fit
+      // the card ourselves (below) which keeps the height correct and avoids
+      // the overlap/clipping that can happen with mermaid's own responsive mode.
+      flowchart: { htmlLabels: true, curve: "basis", useMaxWidth: false },
+      sequence: { useMaxWidth: false },
       themeVariables: { fontFamily: "inherit", fontSize: "15px" },
     });
   } catch (e) {
     console.warn("mermaid init failed", e);
     return;
   }
-  // Render each diagram independently so one bad diagram degrades gracefully
-  // (shows its source) instead of aborting the rest of the page.
-  document.querySelectorAll(".mermaid").forEach((el) => {
+  // Render SEQUENTIALLY (never concurrently — concurrent mermaid.run calls race
+  // on shared measurement state and produce overlapping / clipped output).
+  const nodes = Array.from(document.querySelectorAll(".mermaid"));
+  for (const el of nodes) {
     const src = el.textContent;
-    Promise.resolve()
-      .then(() => window.mermaid.run({ nodes: [el] }))
-      .catch((err) => {
-        console.warn("mermaid render failed for one diagram", err);
-        el.innerHTML =
-          '<pre style="text-align:left;white-space:pre-wrap;color:#b91c1c;font-size:12px;margin:0">' +
-          "⚠️ 此图渲染失败,原始定义如下:\n" +
-          src.replace(/&/g, "&amp;").replace(/</g, "&lt;") +
-          "</pre>";
-      });
-  });
+    el.setAttribute("data-src", src);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await window.mermaid.run({ nodes: [el] });
+      // Force the rendered SVG to fit the card width with a correct height
+      // (overrides mermaid's inline max-width; height:auto preserves aspect
+      // ratio so the card reserves the right amount of vertical space).
+      const svg = el.querySelector("svg");
+      if (svg) {
+        svg.style.maxWidth = "100%";
+        svg.style.height = "auto";
+        svg.removeAttribute("width");
+      }
+    } catch (err) {
+      console.warn("mermaid render failed for one diagram", err);
+      el.innerHTML =
+        '<pre style="text-align:left;white-space:pre-wrap;color:#b91c1c;font-size:12px;margin:0">' +
+        "⚠️ 此图渲染失败,原始定义如下:\n" +
+        src.replace(/&/g, "&amp;").replace(/</g, "&lt;") +
+        "</pre>";
+    }
+  }
 }
 
 /* ---------- theme ---------- */
