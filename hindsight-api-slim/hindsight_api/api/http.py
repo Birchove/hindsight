@@ -6986,6 +6986,7 @@ def _register_routes(app: FastAPI):
                     content_dict["update_mode"] = item.update_mode
                 strategy_groups[effective].append(content_dict)
 
+            # 异步处理分支
             if request.async_:
                 if request.operation_id is not None and len(strategy_groups) != 1:
                     raise HTTPException(
@@ -7016,6 +7017,7 @@ def _register_routes(app: FastAPI):
                         "operation_ids": all_operation_ids if len(all_operation_ids) > 1 else None,
                     }
                 )
+            # 同步处理分支
             else:
                 # Check if batch API is enabled - if so, require async mode
                 from hindsight_api.config import get_config
@@ -7067,6 +7069,8 @@ def _register_routes(app: FastAPI):
                         "usage": total_usage,
                     }
                 )
+        # 异常处理
+        
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except RetainOperationConflictError as e:
