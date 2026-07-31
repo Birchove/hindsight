@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>03 · Retain End-to-End — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Part 2 · Writing (Retain)</p>
+      <h1>03 · Retain End-to-End</h1>
+      <p class="lead">Retain is the write path. This chapter follows <strong>one typical request</strong> (text JSON, synchronous, no delta hit) from HTTP all the way to storage, threading the three code layers together, and explains the seemingly over-engineered <strong>streaming mini-batch + phased-transaction</strong> skeleton. The two finer pieces — fact extraction/chunking, and entities/edges — get their own chapters (04, 05).</p>
+
+      <div class="keypoints">
+        <h3>Chapter takeaways</h3>
+        <ul>
+          <li>Retain does not “store the text then embed it” — it turns text into <strong>atomic facts + entities + three edge types</strong>, pre-building the structure Recall's four paths rely on.</li>
+          <li>A request crosses three layers: <strong><code>api_retain</code> (translate &amp; route) → <code>retain_batch_async</code> (guards &amp; batching) → <code>orchestrator.retain_batch</code> (real orchestration)</strong>.</li>
+          <li>The main execution path is the <strong>streaming mini-batch</strong>: chunk everything up front, then per mini-batch “extract → build edges → commit → release”; small documents use the same path (one batch).</li>
+          <li>Correctness rests on <strong>document-level <code>content_hash</code> + chunk-level hash + <code>FOR UPDATE</code></strong>; the delta path is “optimistic read + in-transaction recheck”.</li>
+          <li>Sync and async paths both exist; async uses <code>operation_id</code> for idempotency, and an oversized single item is <strong>not split into concurrent siblings</strong> but sliced sequentially in-process.</li>
+        </ul>
+      </div>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Almost all the complexity comes from three trade-offs</p>
+        <p>Recall the three trade-offs from ch01; Retain is where they concentrate most: <strong>LLM slow &amp; costly ↔ writes fast &amp; recoverable</strong> (→ streaming, delta, async); <strong>retrieval needs precomputed structure ↔ computing it can fail</strong> (→ Phase1/2/3); <strong>concurrent multi-tenancy ↔ per-document consistency</strong> (→ content_hash, FOR UPDATE, sequential slicing within a document). Read this chapter with them in mind.</p>
+      </div>
+
+      <h2 id="seq">1. The full sequence of one request</h2>
+      <div class="diagram">
+        <div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as api_retain
+  participant E as MemoryEngine
+  participant O as orchestrator.retain_batch
+  participant X as fact_extraction
+  participant DB as Database
+  C->>H: POST /banks/id/memories
+  H->>H: MemoryItem to content_dict<br/>group by strategy
+  H->>E: retain_batch_async(group)
+  E->>E: auth / sanitize / validate document_id<br/>split into sub-batches by token
+  E->>E: resolve config + apply_strategy
+  E->>O: retain_batch(...)
+  O->>O: narrator / defense / append / stale
+  O->>O: _try_delta_retain (continue if no hit)
+  O->>X: chunk_text pre-chunks everything
+  loop each mini-batch
+    O->>X: extract_facts_from_contents
+    X-->>O: facts
+    O->>O: embed -> Phase1 -> Phase2 (commit)
+  end
+  O->>DB: Phase3 final semantic ANN (after commit)
+  O-->>E: unit_ids + usage
+  E-->>H: aggregate
+  H-->>C: RetainResponse
+        </div>
+        <div class="diagram-caption">Fig 3-1: the full synchronous Retain. The “loop” block is the streaming body, expanded in §5; Phase1/2/3 are expanded in ch05.</div>
+      </div>
+
+      <h2 id="l1">2. Layer one: HTTP only “translates &amp; routes”</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>api/http.py</code> → <code>api_retain</code> (request models are <code>RetainRequest</code> / <code>MemoryItem</code> in the same file).</p>
+      <p>This layer <strong>calls no LLM and writes no business tables</strong>. It does three things:</p>
+      <ol>
+        <li>Reduce each <code>MemoryItem</code> into the engine's internal <code>content_dict</code> (<code>timestamp</code> → <code>event_date</code>, the string <code>"unset"</code> → <code>None</code>, etc.).</li>
+        <li><strong>Group by <code>item.strategy</code></strong> — one request may carry several strategies, but each must enter the engine separately.</li>
+        <li><code>async=false</code> → call <code>retain_batch_async</code> (sync); <code>async=true</code> → call <code>submit_async_retain</code> (enqueue).</li>
+      </ol>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Why group by strategy at the HTTP layer?</p>
+        <p>Because the engine's <code>apply_strategy</code> applies <strong>one resolved config to a whole batch</strong>. If you mixed <code>conversations</code> (chat) and <code>documents</code> (long text) into one <code>retain_batch</code>, only one config could apply and the extraction rules / chunk size would be wrong. So <strong>mixed strategies must be split at HTTP</strong>. Also, when an <code>operation_id</code> (idempotency key) is present, only one strategy group is allowed, else the idempotency semantics are ambiguous → 400.</p>
+      </div>
+
+      <h2 id="l2">3. Layer two: the Engine facade and its guards</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>engine/memory_engine.py</code> → <code>retain_batch_async</code> (public entry) → <code>_retain_batch_async_internal</code> (config prep before the orchestrator); splitting lives in <code>_split_contents_into_sub_batches</code>. <strong>Jump by function name only.</strong></p>
+      <p>The facade concentrates a pile of cross-cutting concerns so the <code>retain/</code> package can stay focused on “extract + write”. In order it does:</p>
+      <ol>
+        <li><strong>Tenant auth</strong>, optional <code>OperationValidator</code> (quota checks, rewriting contents).</li>
+        <li><strong>Deep-copy</strong> the contents — because the orchestrator will <code>pop("content")</code> in place to save memory, and must not mutate the caller's object.</li>
+        <li><code>sanitize_text</code>: strip the bad Unicode that would crash the embedder (lone surrogates etc.; source cites issue <strong>#1875</strong>).</li>
+        <li><strong>Validation</strong>: no duplicate <code>document_id</code> within a batch; <code>append</code> mode requires a <code>document_id</code> and document-text storage enabled.</li>
+        <li>Split into <strong>sub-batches</strong> by token budget (when oversized); when one document is split into several pieces, compute a <code>chunk_index_offset</code> (prevents the chunk-number collision of issue <strong>#1888</strong>).</li>
+        <li><code>_retain_batch_async_internal</code>: <code>resolve_full_config</code> (hierarchical config) → (optional) force chunks mode → <code>apply_strategy</code> → call <code>orchestrator.retain_batch</code>.</li>
+      </ol>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ The engine mutates dicts in place, so the entry must copy</p>
+        <p>This invariant runs through the whole codebase: to save memory the orchestrator will <code>pop("content")</code> and clear large strings. If the facade didn't deep-copy first, the caller's data would be “stolen”. <strong>Anywhere you hand data to <code>retain/</code>, assume it will be mutated in place.</strong></p>
+      </div>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Why is the Engine so “thick”?</p>
+        <p>Security, billing, config hierarchy, and async enqueueing are centralized in one place so the business pipeline (<code>retain/</code>) stays pure. The price is the 14k-line <code>memory_engine.py</code> monolith — which is exactly why you <strong>only jump by function</strong> and never try to read it through.</p>
+      </div>
+
+      <h2 id="l3">4. Layer three: the orchestrator's document-level skeleton</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>engine/retain/orchestrator.py</code> → <code>retain_batch</code>.</p>
+      <p>Once inside the pipeline, it handles “document-level” concerns first, then enters the chunk loop:</p>
+
+      <div class="diagram">
+        <div class="mermaid">
+flowchart TD
+  A[fetch bank profile / narrator] --> B{multiple document_id?}
+  B -->|yes| C[recurse retain_batch per document]
+  B -->|no| D[Memory Defense screening]
+  D --> E[resolve effective_doc_id]
+  E --> F{update_mode = append?}
+  F -->|yes| G[read old original_text, prepend it]
+  F -->|no| H[stale-request check]
+  G --> H
+  H --> I{_try_delta_retain}
+  I -->|hit| Z[return directly]
+  I -->|miss| J[chunk_text pre-chunks everything]
+  J --> K[_streaming_retain_batch]
+        </div>
+        <div class="diagram-caption">Fig 3-2: the document-level skeleton of <code>retain_batch</code>. The “why” of each box follows.</div>
+      </div>
+
+      <h3 id="narrator">Narrator (first-person resolution)</h3>
+      <p><code>_resolve_narrator</code>: the extraction prompt can be injected with “Narrator: name” to help the model resolve the first person (“I” = whom?). But on auto-created banks <code>name == bank_id</code>, and <code>bank_id</code> is often a routing key like <code>agent::channel::user</code>. Injecting that would write the routing key into fact text and pollute later observations — so in that case it is <strong>not injected</strong> (issue <strong>#1680</strong>).</p>
+
+      <h3 id="defense">Memory Defense (pre-write screening)</h3>
+      <p>Before extracting facts, screen for sensitive content, yielding <code>ALLOW / REDACT / BLOCK</code>. If everything is <code>BLOCK</code>, raise <code>MemoryDefenseAllBlockedError</code> → HTTP 422. Located in the front of <code>retain_batch</code> + <code>extensions/memory_defense.py</code>.</p>
+
+      <h3 id="append">Append (it is not “just insert new facts”)</h3>
+      <p>Under <code>update_mode == "append"</code>, the system <strong>reads the already-stored document text and prepends it</strong> to form the full document, then continues (this usually hits the delta path, skipping unchanged prefix chunks). Reading the text: <code>fact_storage.get_document_content</code>. The design is counter-intuitive at first — why re-read the whole thing for an “append”? Because facts are extracted from context; extracting from only the new fragment would produce wrong facts.</p>
+
+      <h3 id="stale">Stale-request (skip outdated requests)</h3>
+      <p>If the document's <code>updated_at</code> is already newer than “this request's start time”, skip it, so a late old request doesn't overwrite a newer session. Note: this is only an <strong>optimization</strong>; real correctness rests on <code>FOR UPDATE</code> + hash inside the transaction (the comment states this explicitly).</p>
+
+      <h2 id="streaming">5. Streaming mini-batch: the main execution path</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>orchestrator._streaming_retain_batch</code>.</p>
+      <p>Even small documents take this path (usually a single mini-batch). The source comment is blunt: this is to <strong>avoid maintaining two code paths</strong> (one for small docs, one for large) that would drift.</p>
+
+      <div class="diagram">
+        <div class="mermaid">
+flowchart LR
+  A[take a batch of chunks] --> B[LLM extracts facts]
+  B --> C[date enrichment + embedding]
+  C --> D[Phase1: entity resolution + ANN<br/>outside transaction]
+  D --> E[Phase2: write facts + links<br/>one short transaction]
+  E --> F[commit, free this batch's memory]
+  F --> A
+        </div>
+        <div class="diagram-caption">Fig 3-3: the inner loop per mini-batch. The Phase1/2/3 transaction split is the focus of ch05.</div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Sub-step</th><th>Function</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>extract facts</td><td><code>_extract_and_embed</code> → <code>extract_facts_from_contents</code></td><td>turn natural language into facts; on failure it must raise, never silently return 0 facts yet mark success (issue <strong>#1833</strong>, see callout)</td></tr>
+            <tr><td>embedding</td><td><code>embedding_processing</code> → <code>embedding_utils</code></td><td>for semantic retrieval and semantic edges; note both files have a <strong>same-named</strong> <code>generate_embeddings_batch</code> — don't mix them</td></tr>
+            <tr><td>Phase1</td><td><code>_pre_resolve_phase1</code></td><td>entity resolution and ANN pre-computation happen <strong>outside the transaction</strong>, so slow reads don't hold locks long</td></tr>
+            <tr><td>Phase2</td><td><code>_insert_facts_and_links</code></td><td>facts + unit_entities + temporal/semantic/causal edges in <strong>one transaction</strong>, so Recall never sees “half the data”</td></tr>
+            <tr><td>crash recovery</td><td>hash check at the top of the same file</td><td>same <code>content_hash</code> and chunk already present → skip committed chunks (§6)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ Extraction failure must be loud (issue #1833)</p>
+        <p>If extraction fails but returns an empty list and the operation is marked completed, the document lands with <strong>0 facts</strong> and the UI shows “success” — <strong>memory silently lost</strong>, and nobody knows. So exhausted-retry and protocol-error paths must <code>raise</code>, letting the upper layer mark it failed / retryable, never pretend success. A core principle: <strong>rather fail-and-retry than silently drop data.</strong></p>
+      </div>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Why document tracking is moved into the first write transaction</p>
+        <p>The “delete old document record, insert new” action is <strong>deliberately moved into the first write transaction</strong>, locking with <code>SELECT … FOR UPDATE</code>. Why? If you “delete the document first, then call the LLM to extract”, there's a gap in which a concurrent request can sneak in and cause duplication. Putting the delete and the subsequent writes in one transaction + a row lock closes that concurrent hole.</p>
+      </div>
+
+      <h2 id="recovery">6. Recoverability: streaming and delta</h2>
+      <h3 id="why-streaming">Why streaming (instead of doing it all at once)</h3>
+      <p>A large document (the comments mention 17k+ chunks) extracted → embedded → written in one shot has unacceptable memory peaks and failure cost: either OOM, or one failure throws the whole document away. Streaming shrinks the failure granularity to “one mini-batch” and bounds the memory peak.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th></th><th>One-shot</th><th>Streaming</th></tr></thead>
+          <tbody>
+            <tr><td>failure granularity</td><td>whole document</td><td>one mini-batch</td></tr>
+            <tr><td>memory peak</td><td>grows with the full fact set</td><td>bounded</td></tr>
+            <tr><td>code path</td><td>simple</td><td>needs recovery / offset / edge cases</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="crash-recovery">How crash recovery works</h3>
+      <div class="diagram">
+        <div class="mermaid">
+sequenceDiagram
+  participant W as Worker / process
+  participant O as streaming
+  participant DB as DB
+  W->>O: retry the same document
+  O->>DB: read documents.content_hash
+  alt hash matches and chunks already exist
+    O->>O: RECOVERY: skip committed chunks
+    O->>DB: process only the rest
+  else hash differs or no record
+    O->>DB: normal full / first-batch in-txn document tracking
+  end
+        </div>
+        <div class="diagram-caption">Fig 3-4: on retrying the same document after a crash, the two-level “document content_hash + chunk hash” lets it skip committed chunks and process only the remainder.</div>
+      </div>
+
+      <h3 id="delta">Delta retain (incremental): spend less, stay correct</h3>
+      <p class="src-ref"><strong>Locate</strong>: <code>orchestrator._try_delta_retain</code>, <code>_classify_chunk_diff</code>, <code>_delta_metadata_only</code>.</p>
+      <p>When the same <code>document_id</code> is upserted repeatedly (a chat session growing longer), re-extracting the whole thing every time explodes LLM cost and latency. Delta re-extracts <strong>only the changed chunks</strong>:</p>
+      <div class="diagram">
+        <div class="mermaid">
+flowchart TD
+  A[read existing chunks without a lock] --> B[classify by content_hash:<br/>unchanged / changed / new / removed]
+  B --> C[open write transaction, FOR UPDATE]
+  C --> D{content_hash still matches?}
+  D -->|yes| E[process only changed chunks]
+  D -->|no| F[abandon delta, fall back to full streaming]
+        </div>
+        <div class="diagram-caption">Fig 3-5: delta = “optimistic read + in-transaction recheck”. Read old data without locking (cheap, fast) to diff; right before writing, recheck the hash under FOR UPDATE; if a concurrent request changed it in the meantime, fall back to the fully-locked full streaming path.</div>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 Pattern name: optimistic read + in-transaction verification</p>
+        <p>Read the old data <strong>without a lock</strong> and diff (cheap, fast); then when truly writing, lock with <code>FOR UPDATE</code> in a short transaction and <strong>re-verify the content_hash</strong>. If someone changed it in the gap, abandon the increment and fall back to full streaming, which is lock-protected throughout. <strong>Append and delta are partners</strong>: append first assembles the full document, then enters delta, so the unchanged prefix chunks are mostly skipped.</p>
+      </div>
+
+      <h2 id="async">7. The async path: parent/child and idempotency</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>memory_engine.submit_async_retain</code>, <code>_handle_batch_retain</code>, <code>_split_contents_into_async_children</code>.</p>
+      <div class="diagram">
+        <div class="mermaid">
+stateDiagram-v2
+  [*] --> Parent: submit_async_retain
+  Parent --> Child: split children by token<br/>do not fragment an oversized item
+  Child --> Worker: poller claims
+  Worker --> Retain: retain_batch_async
+  Retain --> Seq: oversized item sliced in-process, sequentially
+  Seq --> [*]: chunk_index_offset increments
+        </div>
+        <div class="diagram-caption">Fig 3-6: the async path. The parent is a status aggregator; children carry the task body; an oversized single item is not split into concurrent siblings but sliced sequentially within one worker.</div>
+      </div>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Why operation_id idempotency?</p>
+        <p>When a client retries on timeout, the same UUID should “return the original operation, not enqueue again”. The comment stresses: the idempotency <strong>read</strong> is deliberately not in the same transaction as creation; real mutual exclusion rests on <strong>primary-key uniqueness</strong>, with a unique-violation as the fallback. So even if two requests arrive at once, only one insert succeeds.</p>
+      </div>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Why not split an oversized item into concurrent sibling children? (issue #1795)</p>
+        <p>Because there is <strong>no</strong> per-document serialization across workers. If several children shared one <code>document_id</code> and each thought it was <code>is_first_batch</code>, they would cascade-delete each other's written units; and the final ANN edge-insert would hit foreign keys and saturate the pool. So: <strong>an oversized item is one whole child</strong>, sliced <strong>sequentially</strong> in the worker process, with <code>chunk_index_offset</code> continuing the <code>chunk_index</code> (issue <strong>#1888</strong>); <code>document_body_override</code> ensures the stored text is the full document, not the last slice (issue <strong>#1838</strong>).</p>
+      </div>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ Why does the parent often have no task_payload?</p>
+        <p>The parent is a <strong>status aggregator</strong> (it rolls up all children's progress); the children carry the real task body. The two must be created in the <strong>same transaction</strong>, or you get an “orphan parent” that is never executed while queue metrics keep climbing.</p>
+      </div>
+
+      <h2 id="end">8. Wrap-up and return</h2>
+      <ul>
+        <li><strong><code>_run_final_semantic_ann</code></strong> (Phase3): after all batches commit, do one full semantic-neighbor backfill. <strong>Failure must not roll back the written facts</strong> — edges are enhancement, not the memory body (ch05).</li>
+        <li>Returns <code>(per-content unit_id list, TokenUsage, processed_content_tokens)</code>; the HTTP layer aggregates <code>usage</code> into a <code>RetainResponse</code>.</li>
+        <li><strong>Observations are not built yet</strong>: retain only stamps <code>observation_scopes</code> onto the facts; the real merge happens later in consolidation (ch09).</li>
+      </ul>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ Tests worth reading alongside</p>
+        <p>Reading test names + assertions often builds “expected behavior” faster than reading the implementation: <code>tests/test_delta_retain.py</code>, <code>test_retain_append_mode.py</code>, <code>test_async_batch_retain.py</code>, <code>test_async_retain_operation_id.py</code>, <code>test_retain_same_document_concurrency.py</code>, <code>test_retain_transient_extraction_failure.py</code>.</p>
+      </div>
+
+      <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+          <li>Retain's three layers: <code>api_retain</code> (translate &amp; route) → <code>retain_batch_async</code> (guards &amp; batching) → <code>orchestrator.retain_batch</code> (orchestration).</li>
+          <li>The main path is the <strong>streaming mini-batch</strong>: pre-chunk everything → per batch “extract → Phase1 → Phase2 → commit → release”.</li>
+          <li>The correctness trio: document-level <code>content_hash</code>, chunk-level hash, <code>FOR UPDATE</code> row locks; delta is “optimistic read + in-transaction recheck”.</li>
+          <li>Async uses <code>operation_id</code> idempotency; oversized single items are sliced in-process sequentially, not split into concurrent siblings.</li>
+          <li>Core principle: <strong>fail loudly, never silently lose data</strong>.</li>
+        </ul>
+        <p>Next we zoom into the most critical step inside the streaming loop — <strong>how facts are extracted from text and how chunks are cut</strong>.</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>02 · The Data Model: What a Memory Looks Like — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Part 1 · Understanding the System</p>
+      <h1>02 · The Data Model: What a Memory Looks Like</h1>
+      <p class="lead">Every later chapter reads and writes the same handful of tables. This chapter lays the foundation: which tables exist, how they relate, what “one fact” actually looks like on disk, how vectors are stored, and how multi-tenancy is isolated. Read this and none of the later SQL will be foreign.</p>
+
+      <div class="keypoints">
+        <h3>Chapter takeaways</h3>
+        <ul>
+          <li>The heart of memory is the <strong><code>memory_units</code></strong> table — one row = one atomic fact; it also carries the embedding, the BM25 search vector, the temporal fields, and the consolidation bookkeeping.</li>
+          <li>The graph is <code>entities</code> + <code>unit_entities</code> (fact↔entity) and <code>memory_links</code> (the three fact↔fact edge types).</li>
+          <li><strong>Observations are not a separate table</strong> — they are <code>memory_units</code> rows with <code>fact_type='observation'</code>. Don't confuse them with the <code>mental_models</code> table (renamed several times).</li>
+          <li>Vectors use <strong>pgvector (384-dim, HNSW cosine)</strong>; at HEAD there is <strong>one partial index per (bank, fact_type)</strong>.</li>
+          <li>Multi-tenancy = <strong>one schema per tenant + <code>search_path</code></strong>; at runtime a contextvar + <code>fq_table()</code> fully-qualifies every table; banks are isolated by <code>WHERE bank_id = …</code>.</li>
+        </ul>
+      </div>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ Heads-up first: models.py is not the whole truth</p>
+        <p>The SQLAlchemy ORM (<code>models.py</code>) defines only 7 tables and a subset of columns; <strong>the running engine executes hand-written asyncpg SQL</strong> (<code>engine/db/ops_postgresql.py</code>, ~59KB) against a real schema of ~20 tables and many more columns (search vectors, tags, consolidation bookkeeping). <strong>The authoritative sources are the Alembic migrations</strong> (~89 of them) plus that hand-written SQL. The ORM lags the real schema (e.g. <code>Bank</code> still shows the since-renamed <code>background</code> column). When reading the schema, trust the migrations and <code>ops_postgresql.py</code>.</p>
+      </div>
+
+      <h2 id="inventory">1. Table inventory</h2>
+      <p>In three groups by responsibility:</p>
+
+      <h3>① Core memory graph</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Table</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>banks</code></td><td>One row per memory bank: disposition traits, mission, per-bank config, a stable <code>internal_id</code> used for index naming</td></tr>
+            <tr><td><code>documents</code></td><td>Source documents ingested via retain; composite PK <code>(id, bank_id)</code>; stores <code>original_text</code>, the dedup <code>content_hash</code>, retain params, tags</td></tr>
+            <tr><td><code>chunks</code></td><td>Document chunks; <strong>deterministic text PK</strong>; carries <code>content_hash</code> for delta retain</td></tr>
+            <tr><td><code>memory_units</code></td><td><strong>The atomic facts.</strong> embedding, BM25 search vector, fact_type, temporal fields, and all consolidation/observation bookkeeping. <strong>The central table</strong></td></tr>
+            <tr><td><code>entities</code></td><td>Normalized entities; unique per bank on <code>(bank_id, LOWER(canonical_name))</code></td></tr>
+            <tr><td><code>unit_entities</code></td><td>Fact↔entity join table (composite PK, no payload columns)</td></tr>
+            <tr><td><code>entity_cooccurrences</code></td><td>Materialized cache of entity co-occurrence counts (feeds normalization scoring)</td></tr>
+            <tr><td><code>memory_links</code></td><td>Typed, weighted, directed edges between facts (temporal / semantic / causal)</td></tr>
+            <tr><td><code>invalidated_memory_units</code></td><td>Cold archive: invalidated facts are <strong>moved</strong> here so the recall hot path never sees them</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>② Consolidation &amp; reflect layer</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Table</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>mental_models</code></td><td><strong>Renamed twice.</strong> At HEAD it stores “pinned reflect responses / directive mental models”, subtypes <code>'directive'</code> and <code>'pinned'</code>. <strong>Consolidated knowledge is not here</strong> — it's the <code>fact_type='observation'</code> rows in <code>memory_units</code></td></tr>
+            <tr><td><code>directives</code></td><td>Hard rules, in their own table</td></tr>
+            <tr><td><code>observation_history</code> / <code>mental_model_history</code></td><td>Edit history, split out of the main tables</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>③ Operational / infra</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Table</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>async_operations</code></td><td>Async jobs (retain/consolidation/…): status, worker, retries, payload</td></tr>
+            <tr><td><code>webhooks</code></td><td>Per-bank webhook subscriptions</td></tr>
+            <tr><td><code>file_storage</code></td><td>Zero-config BYTEA/BLOB file store</td></tr>
+            <tr><td><code>audit_log</code> / <code>llm_requests</code></td><td>Audit and LLM-call logs</td></tr>
+            <tr><td><code>graph_maintenance_queue</code></td><td>Deferred graph-maintenance work items</td></tr>
+            <tr><td><code>memory_units_bm25</code></td><td>Materialized view for BM25 scoring (<code>to_tsvector</code> + a doc-length factor)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="er">2. Relations and cardinalities</h2>
+      <div class="diagram">
+        <div class="mermaid">
+erDiagram
+  banks ||--o{ documents : "bank_id"
+  banks ||--o{ mental_models : "bank_id"
+  documents ||--o{ chunks : "(id,bank_id) CASCADE"
+  documents ||--o{ memory_units : "(id,bank_id) CASCADE"
+  chunks ||--o{ memory_units : "chunk_id SET NULL"
+  memory_units }o--o{ entities : "unit_entities"
+  memory_units ||--o{ memory_links : "from/to"
+  memory_units ||--o{ memory_links : "to"
+  entities ||--o{ entity_cooccurrences : "pair"
+  memory_units }o--o{ memory_units : "source_memory_ids (observation)"
+        </div>
+        <div class="diagram-caption">Fig 2-1: core relations. Note an observation's link to its source facts is a <code>UUID[]</code> array (a soft reference), not a foreign key; and on PG, banks are mostly not FK-referenced by their data tables — isolation is logical via the <code>bank_id</code> column.</div>
+      </div>
+      <ul>
+        <li><strong>bank → documents / memory_units / entities</strong>: 1∶N (every row carries <code>bank_id</code>).</li>
+        <li><strong>document → chunks</strong>: 1∶N via composite FK <code>(document_id, bank_id)</code>, <code>ON DELETE CASCADE</code>.</li>
+        <li><strong>chunk → memory_units</strong>: 1∶N but <code>ON DELETE SET NULL</code> — deleting a chunk <strong>orphans</strong> facts rather than destroying them.</li>
+        <li><strong>memory_unit ↔ entity</strong>: M∶N through <code>unit_entities</code>, composite PK, both sides CASCADE.</li>
+        <li><strong>memory_unit ↔ memory_unit</strong>: M∶N directed through <code>memory_links</code>, 4-column PK <code>(from_unit_id, to_unit_id, link_type, entity_id)</code> — the same pair can carry one edge of each type.</li>
+        <li><strong>observation → source facts</strong>: <strong>not a FK</strong> — a <code>source_memory_ids UUID[]</code> array column, queried with array operators.</li>
+      </ul>
+
+      <h2 id="mu">3. <code>memory_units</code>: the anatomy of a fact</h2>
+      <p>This is the most important table in the system. Grouping its fields by purpose:</p>
+      <div class="code-block">
+        <div class="code-header"><span>alembic/versions/5a366d414dce_initial_schema.py (excerpt; later migrations add many columns)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">op.create_table(
+    "memory_units",
+    sa.Column("id", postgresql.UUID(as_uuid=True),
+              server_default=sa.text("gen_random_uuid()"), nullable=False),
+    sa.Column("bank_id", sa.Text(), nullable=False),
+    sa.Column("document_id", sa.Text(), nullable=True),
+    sa.Column("text", sa.Text(), nullable=False),             # the fact text
+    sa.Column("embedding", Vector(384), nullable=True),       # pgvector
+    sa.Column("context", sa.Text(), nullable=True),
+    sa.Column("event_date", postgresql.TIMESTAMP(timezone=True), nullable=False),
+    sa.Column("occurred_start", ...), sa.Column("occurred_end", ...),
+    sa.Column("mentioned_at", ...),
+    sa.Column("fact_type", sa.Text(), server_default="world", nullable=False),
+    ...
+)
+# the fact_type CHECK constraint at HEAD is:
+#   fact_type IN ('world', 'experience', 'observation')</code></pre>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Group</th><th>Fields</th></tr></thead>
+          <tbody>
+            <tr><td>identity / tenant</td><td><code>id</code> (UUID), <code>bank_id</code> (isolation key, never null)</td></tr>
+            <tr><td>provenance</td><td><code>document_id</code>, <code>chunk_id</code> (SET NULL when the chunk is deleted)</td></tr>
+            <tr><td>content</td><td><code>text</code> (the fact sentence, NOT NULL), <code>context</code>, <code>metadata</code> (JSONB), <code>tags</code> (VARCHAR[]), <code>search_vector</code> (the generated BM25 representation)</td></tr>
+            <tr><td>semantics</td><td><code>embedding</code> (vector(384)), <code>fact_type</code> (world/experience/observation)</td></tr>
+            <tr><td>temporality (four!)</td><td><code>event_date</code> (required, kept for back-compat), <code>occurred_start/end</code> (when it happened, a range), <code>mentioned_at</code> (when it was mentioned)</td></tr>
+            <tr><td>lifecycle</td><td><code>created_at/updated_at</code>, <code>access_count</code>, <code>edited_at</code>, <code>consolidated_at</code> (consumed by consolidation), <code>consolidation_failed_at</code></td></tr>
+            <tr><td>observation-only</td><td><code>proof_count</code> (supporting-fact count), <code>source_memory_ids</code> (UUID[]), <code>history</code> (JSONB), <code>observation_scopes</code>, <code>text_signals</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout concept">
+        <p class="callout-title">📖 Why four timestamp fields?</p>
+        <p>Because the temporal semantics of a memory are genuinely multi-dimensional: <strong>when an event happened</strong> (<code>occurred_start/end</code>), <strong>when it was mentioned</strong> (<code>mentioned_at</code>), plus a fallback <code>event_date</code>. Temporal retrieval (ch07) matches a window against both <code>occurred_*</code> and <code>mentioned_at</code> — “what happened in June” and “what did we talk about in June” are different questions.</p>
+      </div>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ <code>chunk_id</code> is deterministic, not a UUID</p>
+        <p><code>chunk_id = f"{bank_id}_{document_id}_{chunk_index}"</code> (<code>chunk_storage.py</code>). Inserts are idempotent upserts — re-submitting the same <code>document_id</code> yields the same <code>chunk_id</code>s, and <strong>overwriting is the correct behavior</strong>. This is also why chunking must be idempotent (ch04): a <code>chunk_index</code> collision would hit the PK directly.</p>
+      </div>
+
+      <h2 id="graph-tables">4. <code>entities</code> / <code>unit_entities</code> / <code>memory_links</code></h2>
+      <div class="code-block">
+        <div class="code-header"><span>initial_schema.py · entities unique index + memory_links constraints (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># entities: unique per (bank, lowercased canonical name) -- "Paris" and "paris" are one entity
+op.execute("CREATE UNIQUE INDEX idx_entities_bank_lower_name "
+           "ON entities (bank_id, LOWER(canonical_name))")
+
+# memory_links: type and weight constraints
+CheckConstraint(
+  "link_type IN ('temporal','semantic','entity','causes','caused_by','enables','prevents')")
+CheckConstraint("weight &gt;= 0.0 AND weight &lt;= 1.0")
+
+# uniqueness: the nullable entity_id is replaced by a nil-UUID so it fits a unique index
+op.execute("CREATE UNIQUE INDEX idx_memory_links_unique ON memory_links "
+  "(from_unit_id, to_unit_id, link_type, "
+  " COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid))")</code></pre>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ The memory_links FKs are DEFERRABLE</p>
+        <p>The <code>from_unit_id</code>/<code>to_unit_id</code> foreign keys are <strong><code>DEFERRABLE INITIALLY DEFERRED</code></strong>, to break an insert-vs-cascade-delete deadlock. The cost is that the link inserter can't rely on a <code>WHERE EXISTS</code> guard and instead locks the parent units <code>FOR KEY SHARE</code> inside the same statement (seen in ch05). Also, although the CHECK still lists <code>'entity'</code>, that's only for historical rows — Retain no longer writes entity edges.</p>
+      </div>
+
+      <h2 id="obs">5. Observations are not a separate table (terminology trap)</h2>
+      <p>There is <strong>no <code>observations</code> table</strong> on PostgreSQL. A consolidated observation is a <code>memory_units</code> row with <code>fact_type='observation'</code>, using the observation-only fields (<code>proof_count</code>, <code>source_memory_ids</code>, <code>history</code>, <code>observation_scopes</code>).</p>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ The term “mental model” has meant three things — read the migrations, not the names</p>
+        <p>This word has historically referred to three different things:<br>
+        (a) a <code>fact_type</code> in <code>memory_units</code>, later renamed to <code>'observation'</code> by <code>t5o6p7q8r9s0</code>;<br>
+        (b) a standalone <code>mental_models</code> v4 table, later <strong>dropped entirely</strong> by <code>p1k2l3m4n5o6</code>;<br>
+        (c) the current <code>mental_models</code> table, which is actually <code>reflections ← pinned_reflections</code> renamed, storing reflect results (subtypes directive/pinned).<br>
+        So CLAUDE.md's “mental models = consolidated knowledge” maps, at HEAD, to the <code>fact_type='observation'</code> rows — <strong>not</strong> the <code>mental_models</code> table. This is exactly why ch01 insists “observation ≠ mental model”.</p>
+      </div>
+
+      <h2 id="pgvector">6. pgvector: how vectors are stored and indexed</h2>
+      <ul>
+        <li><strong>Column</strong>: <code>memory_units.embedding</code>, type <code>vector(384)</code>. The dimension 384 is a module constant (<code>DEFAULT_EMBEDDING_DIMENSION</code>), <strong>not configurable per bank</strong> — when a model change alters the dimension, the system recomputes rather than storing mixed dimensions (the archive table <code>invalidated_memory_units</code> deliberately has no embedding column, so an “archive vector” can't fall out of sync with the live model, #2209).</li>
+        <li><strong>Index</strong>: HNSW + cosine (<code>vector_cosine_ops</code>). The vector backend is <strong>pluggable</strong> (pgvector / pgvectorscale diskann / vchord / scann), mapped by <code>_vector_index.py</code>'s <code>_INDEX_USING_CLAUSES</code>:</li>
+      </ul>
+      <div class="code-block">
+        <div class="code-header"><span>_vector_index.py · _INDEX_USING_CLAUSES</span><span class="lang">python</span></div>
+        <pre><code class="language-python">_INDEX_USING_CLAUSES = {
+    "pgvector":      "USING hnsw (embedding vector_cosine_ops)",
+    "pgvectorscale": "USING diskann (embedding vector_cosine_ops) WITH (num_neighbors = 50)",
+    "pg_diskann":    "USING diskann (embedding vector_cosine_ops) WITH (max_neighbors = 50)",
+    "vchord":        "USING vchordrq (embedding vector_cosine_ops)",
+    "scann":         "USING scann (embedding cosine) WITH (mode = 'AUTO')",
+}</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 At HEAD: the global index is gone — replaced by per-(bank, fact_type) partial indexes</p>
+        <p>Early on there was a single global HNSW index. Migration <code>d5e6f7a8b9c0</code> dropped it in favor of three partial indexes per bank: <code>idx_mu_emb_{worl|expr|obsv}_{first 16 hex of internal_id}</code>. Why? Because retrieval SQL always carries <code>WHERE bank_id = … AND fact_type = …</code> before <code>ORDER BY embedding &lt;=&gt; …</code>; the partial index lets the planner go straight to the small index instead of being out-competed by the global one. The index name uses <code>internal_id</code> rather than <code>bank_id</code> so names stay <strong>stable and within PostgreSQL's 63-character identifier limit</strong>. Recall's per-fact_type UNION ALL arms (ch07) exist precisely to hit these partial indexes.</p>
+      </div>
+
+      <h2 id="fts">7. Full-text search (BM25) storage</h2>
+      <p>Parallel to vectors, <code>memory_units</code> also has a <code>search_vector</code> column. The default backend is native tsvector:</p>
+      <div class="code-block">
+        <div class="code-header"><span>initial_schema.py · the generated full-text column</span><span class="lang">sql</span></div>
+        <pre><code class="language-sql">ALTER TABLE memory_units
+ADD COLUMN search_vector tsvector
+GENERATED ALWAYS AS (
+  to_tsvector('english', COALESCE(text, '') || ' ' || COALESCE(context, ''))
+) STORED;</code></pre>
+      </div>
+      <p>But the <strong>type of <code>search_vector</code> varies by backend</strong>: native → a generated tsvector; pg_textsearch/pg_search → a dummy TEXT column with indexes on the base columns; vchord → <code>bm25_catalog.bm25vector</code>. So runtime inserts branch by backend (and BM25 retrieval in ch07 uses this column too).</p>
+
+      <h2 id="tenancy">8. Multi-tenancy: three layers of isolation</h2>
+      <div class="diagram">
+        <div class="mermaid">
+flowchart TB
+  subgraph s1["Mechanism 1 · one PostgreSQL schema per tenant"]
+    A["migration carries target_schema<br/>SET search_path TO tenant_x, public"]
+  end
+  subgraph s2["Mechanism 2 · runtime contextvar + full qualification"]
+    B["after auth _current_schema.set(...)<br/>fq_table() prefixes table as schema.table"]
+  end
+  subgraph s3["Mechanism 3 · bank logical isolation"]
+    C["within a schema, every table carries bank_id<br/>WHERE bank_id = $n"]
+  end
+  s1 --> s2 --> s3
+        </div>
+        <div class="diagram-caption">Fig 2-2: three layers of isolation. The schema gives physical isolation, <code>fq_table</code> gives runtime qualification, and <code>bank_id</code> gives logical isolation within a schema.</div>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/schema.py · fq_table</span><span class="lang">python</span></div>
+        <pre><code class="language-python">def fq_table(table_name: str) -&gt; str:
+    if _is_oracle():
+        return table_name              # Oracle uses ALTER SESSION SET CURRENT_SCHEMA
+    from .memory_engine import get_current_schema
+    return f"{get_current_schema()}.{table_name}"   # PG: schema.table</code></pre>
+      </div>
+      <p>Key points: the migration tree runs <strong>once per tenant schema</strong> (<code>hindsight-admin run-db-migration --schema tenant_xyz</code>); the current schema lives in a contextvar, set after tenant authentication; <strong>all</strong> raw SQL fully-qualifies via <code>fq_table()</code>. Banks, by contrast, are isolated <strong>not by FK or row-level security</strong> but by a <code>WHERE bank_id = $n</code> on every query — on PG the data tables have no foreign key to <code>banks</code> at all (the Oracle baseline is stricter and adds <code>ON DELETE CASCADE</code> bank FKs).</p>
+
+      <h2 id="gotchas">9. Pitfalls to remember</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Pitfall</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td><code>chunk_id</code> deterministic</td><td><code>{bank}_{doc}_{index}</code>, idempotent upsert, overwrite is correct</td></tr>
+            <tr><td>two-level content hash</td><td>chunk-level <code>sha256(chunk_text)</code> + document-level hash, drive delta; hash is computed even when raw text isn't stored</td></tr>
+            <tr><td>entity edges are derived</td><td><code>memory_links</code> no longer stores entity edges; <code>/graph</code> computes them from <code>unit_entities</code> (they were 53% of edges, ~190MB)</td></tr>
+            <tr><td>nullable <code>entity_id</code></td><td>the unique index uses a nil-UUID in place of NULL</td></tr>
+            <tr><td>terminology drift</td><td>“mental model” meant three things; the <code>opinion</code> fact_type was deleted wholesale; read the migrations, not the names</td></tr>
+            <tr><td><code>models.py</code> lags</td><td>the ORM lacks <code>search_vector</code>/<code>tags</code>/<code>proof_count</code>/<code>source_memory_ids</code> etc.; trust the migrations</td></tr>
+            <tr><td>observation provenance differs by dialect</td><td>PG uses the <code>source_memory_ids[]</code> array; Oracle uses an <code>observation_sources</code> junction table</td></tr>
+            <tr><td>invalidation moves, not flags</td><td>invalidated facts move to <code>invalidated_memory_units</code> (no embedding column); recall never reads it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+          <li>The central table is <code>memory_units</code> (one row per fact), holding the embedding, search_vector, four timestamps, and consolidation bookkeeping.</li>
+          <li>The graph = <code>entities</code> + <code>unit_entities</code> + <code>memory_links</code> (three edge types; nullable column via nil-UUID; deferrable FKs).</li>
+          <li>An observation is a <code>fact_type='observation'</code> row, <strong>not a separate table</strong>; don't conflate with the <code>mental_models</code> table.</li>
+          <li>Vectors: pgvector 384-dim HNSW; at HEAD, one partial index per (bank, fact_type); full-text search runs in parallel.</li>
+          <li>Multi-tenancy in three layers: schema/search_path + contextvar/fq_table + <code>bank_id</code> WHERE.</li>
+        </ul>
+        <p>Foundation laid. From the next chapter on, we watch Retain write into these tables.</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>10 · Reflect: Disposition-Aware Reasoning — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Part 4 · Reasoning &amp; Consolidation</p>
+      <h1>10 · Reflect: Disposition-Aware Reasoning</h1>
+      <p class="lead">Recall is “pure retrieval”: give a query, get facts back. Reflect is “reasoning”: it runs a <strong>tool-using agent loop</strong> that decides for itself what to fetch and how deep, then synthesizes a grounded, <strong>disposition-aware</strong> answer. This chapter unpacks that loop, its tools, the division of labor between mental models and observations, and the contrast between the “soft” disposition mechanism and the “hard” directive mechanism.</p>
+
+      <div class="keypoints">
+        <h3>Chapter takeaways</h3>
+        <ul>
+          <li>Reflect is <strong>read-only</strong>: it writes no data, producing one markdown answer.</li>
+          <li>It's a <strong>native tool-calling loop</strong> (not ReAct text-parsing), default 10 turns, scaled by budget to 5/10/20.</li>
+          <li>Context is <strong>lazy-loaded</strong>: the initial prompt carries only the bank identity + directives + a mental-model <em>count</em>; memories are fetched by tools on demand, so the prompt doesn't grow with the bank.</li>
+          <li>Retrieval is <strong>hierarchical</strong>: mental model (curated) &gt; observation (consolidated) &gt; recall (raw facts), and it's <strong>forced in that order first, then handed to the model</strong>.</li>
+          <li><strong>Disposition is soft</strong> (one <code>k=v</code> line left to the model); <strong>directives are hard</strong> (MANDATORY, injected at start and end, <code>done</code> must report compliance). Don't conflate them.</li>
+        </ul>
+      </div>
+
+      <h2 id="flow">1. Reflect end-to-end</h2>
+      <div class="diagram">
+        <div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as api_reflect
+  participant E as reflect_async
+  participant A as run_reflect_agent
+  participant T as tools recall·observations·MM·expand
+  C->>H: POST /banks/id/reflect
+  H->>E: reflect_async with query
+  E->>E: sanitize · provider not none · auth
+  E->>E: load bank profile name·mission·disposition
+  E->>E: resolve config · only COUNT mental models · no preload
+  E->>E: build 4 tool callbacks · load directives · fetch freshness
+  E->>A: run_reflect_agent with wall timeout
+  loop agent loop
+    A->>T: call tool · forced sequence then auto
+    T-->>A: evidence memories · observations · MM
+  end
+  A-->>E: final markdown · based_on · usage
+  E-->>H: ReflectResponse
+  H-->>C: answer
+        </div>
+        <div class="diagram-caption">Fig 10-1: the full Reflect. Note the entry <strong>does not preload</strong> memories/observations/mental models — it only decides which tools to expose.</div>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 Why not stuff memories into the prompt up front?</p>
+        <p>The source comment is blunt: “mental models are <strong>NOT preloaded</strong> to keep the initial prompt small … critical for banks with many mental models.” If you loaded a bank's entire observation/model set into the prompt at the start, the bigger the bank the more the prompt explodes. Instead it's <strong>lazy</strong>: the prompt carries only the bank identity, the directives, and a <code>COUNT(*)</code> (which decides whether to expose the “search mental models” tool). So the initial prompt is <strong>O(1)</strong>, independent of bank size; memories are fetched by the agent through tools as needed.</p>
+      </div>
+
+      <h2 id="loop">2. The agent loop</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>engine/reflect/agent.py</code> → <code>_run_reflect_agent_inner</code>.</p>
+      <p>It's a <strong>native tool-calling loop</strong> (OpenAI-format <code>tools</code> + <code>tool_choice</code>, via <code>llm_config.call_with_tools</code>); tool calls come back as structured <code>result.tool_calls</code> — <strong>not</strong> the ReAct style of making the model emit text that you then parse. Which LLM? The bank-resolved reflect config (any provider). Termination conditions (any one ends the loop):</p>
+      <ul>
+        <li>the model calls the <code>done()</code> tool with an answer;</li>
+        <li>the model returns <strong>no tool call after having already produced one earlier</strong> → treated as a legitimate stop, and a clean forced synthesis runs; (if it <strong>never</strong> produced a tool call, that's the transport-doesn't-support-tools case → raise <code>ReflectToolCallError</code>);</li>
+        <li>the last turn (<code>is_last</code>) → tools removed, forced text response;</li>
+        <li><strong>proactive context-budget guard</strong>: accumulated messages exceed <code>max_context_tokens</code> → forced synthesis;</li>
+        <li>context overflow / unrecoverable LLM error → forced synthesis from gathered evidence.</li>
+      </ul>
+      <p><strong>Max turns</strong> default 10, but <code>reflect_async</code> scales by budget: <code>base × {LOW:0.5, MID:1.0, HIGH:2.0}</code> → effectively 5/10/20.</p>
+
+      <div class="callout concept">
+        <p class="callout-title">📖 Key design: forced hierarchical retrieval first, then free play</p>
+        <p>The first few turns <strong>don't use <code>auto</code></strong>. The loop <strong>forces</strong> the model to call the retrieval layers in order (mental models → observations → recall), only then handing control back to <code>auto</code>:</p>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/reflect/agent.py · _run_reflect_agent_inner (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># Force the full hierarchical retrieval path (only for enabled tools), then allow auto.
+forced_sequence = []
+if has_mental_models:   forced_sequence.append("search_mental_models")
+if include_observations: forced_sequence.append("search_observations")
+if include_recall:       forced_sequence.append("recall")
+
+if iteration &lt; len(forced_sequence):
+    iter_tool_choice = LLMToolChoice.named(forced_sequence[iteration])
+else:
+    iter_tool_choice = LLM_TOOL_CHOICE_AUTO
+
+result = await llm_config.call_with_tools(
+    messages=messages, tools=tools, scope="reflect_tool_call",
+    tool_choice=iter_tool_choice)</code></pre>
+      </div>
+      <p>Multiple tool calls in one turn run <strong>in parallel</strong> via <code>asyncio.gather</code>. There's also an optimization: if a forced <code>search_mental_models</code> result is “fresh and usable”, it releases the loop to <code>auto</code> early, short-circuiting the lower layers.</p>
+
+      <h2 id="tools">3. Tools: the hierarchical four + done</h2>
+      <p class="src-ref"><strong>Locate</strong>: schemas in <code>reflect/tools_schema.py</code>, implementations in <code>reflect/tools.py</code>, dispatch in <code>agent.py:_execute_tool</code>.</p>
+      <p>The module docstring states the philosophy: <strong>“a hierarchical retrieval strategy: ① search_mental_models (curated, highest quality) → ② search_observations (consolidated, freshness-aware) → ③ recall (raw facts, ground-truth fallback).”</strong></p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>search_mental_models</code></td><td>semantic search over the <code>mental_models</code> table; returns content + <code>is_stale</code>. Exposed only if the bank has any</td></tr>
+            <tr><td><code>search_observations</code></td><td>search consolidated observations (<code>fact_type='observation'</code>), returning freshness; if stale, prompts “also use recall to verify”</td></tr>
+            <tr><td><code>recall</code></td><td>raw facts (world+experience) as fallback; for when there are no models/observations, they're stale, or detail is needed</td></tr>
+            <tr><td><code>expand</code></td><td>by <code>memory_ids</code>, fetch more context (memory → chunk → document); not exposed when document-text storage is off</td></tr>
+            <tr><td><code>done</code></td><td>give the final markdown answer + supporting IDs; with directives, also requires <code>directive_compliance</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span>engine/reflect/tools_schema.py · TOOL_SEARCH_OBSERVATIONS (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">{"type": "function",
+ "function": {
+   "name": "search_observations",
+   "description": (
+     "Search consolidated observations (auto-generated knowledge). ... "
+     "If an observation is STALE, you should ALSO use recall() to verify ... "
+     "IMPORTANT: If search_mental_models is available, you MUST call it FIRST ..."),
+   "parameters": {"type": "object",
+     "properties": {
+       "reason": {"type": "string", "description": "Why you're searching (for debugging)"},
+       "query":  {"type": "string"},
+       "max_tokens": {"type": "integer"}},
+     "required": ["reason", "query"]}}}</code></pre>
+      </div>
+      <p>Every tool carries a <code>reason</code> field “for debugging” — it's recorded into the tool trace and otherwise unused. <code>search_observations</code> actually <strong>reuses recall</strong>, just filtered to observations:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/reflect/tools.py · tool_search_observations (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">result = await memory_engine.recall_async(
+    bank_id=bank_id, query=query, fact_type=["observation"],
+    max_tokens=max_tokens, internal=True, ...)      # internal=True avoids double billing
+
+is_stale = pending_consolidation &gt; 0
+freshness = ("up_to_date" if pending_consolidation == 0
+             else "slightly_stale" if pending_consolidation &lt; 10 else "stale")</code></pre>
+      </div>
+
+      <h2 id="mm-vs-obs">4. Mental model vs observation: the concrete difference</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th></th><th>mental model</th><th>observation</th></tr></thead>
+          <tbody>
+            <tr><td>source</td><td><strong>user-defined</strong> topic (top-down)</td><td><strong>auto-synthesized</strong> by the consolidation engine (bottom-up)</td></tr>
+            <tr><td>storage</td><td><code>mental_models</code> table (name/content/embedding/trigger…)</td><td><code>memory_units</code> with <code>fact_type='observation'</code></td></tr>
+            <tr><td>essence</td><td>a “pinned reflect result”, refreshed on demand</td><td>has <code>title</code>/<code>content</code>/<code>evidence</code> (each evidence item must carry an <strong>exact quote</strong>)</td></tr>
+            <tr><td>trend</td><td>has <code>is_stale</code> (new memories since last refresh?)</td><td>a <code>Trend</code> <strong>computed algorithmically</strong> from evidence timestamps (STABLE/STRENGTHENING/WEAKENING/NEW/STALE), not LLM-judged</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout tip">
+        <p class="callout-title">✅ The “structured refresh” of a mental model</p>
+        <p>When refreshing a mental model, the system <strong>does not let the model rewrite the whole text</strong> (that would “drift”); instead it has the model emit a set of structured <strong>operations</strong> (<code>append_block</code>, <code>replace_section_blocks</code>, …) applied to a <code>StructuredDocument</code>. Untouched sections are <strong>copied verbatim</strong> — “prose drift becomes structurally impossible”. <code>reflect/structured_doc.py</code> + <code>delta_ops.py</code> do this (the write path, not reflect's read path).</p>
+      </div>
+
+      <h2 id="disposition">5. Disposition (soft) vs directive (hard)</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>reflect/prompts.py</code>.</p>
+      <p>The injection of <strong>disposition</strong> is strikingly plain: three 1–5 integers, serialized into one line in the system prompt, <strong>with no “if skepticism ≥ 4 then do X” logic</strong> — the model interprets it itself:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/reflect/prompts.py · build_system_prompt_for_tools (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">parts.append(f"## Memory Bank: {name}")
+if mission: parts.append(f"Mission: {mission}")
+disposition = bank_profile.get("disposition", {})
+if disposition:
+    traits = [f"{k}={disposition[k]}" for k in ("skepticism","literalism","empathy") if k in disposition]
+    if traits: parts.append(f"Disposition: {', '.join(traits)}")
+# renders as: ## Memory Bank: Alice / Mission: ... / Disposition: skepticism=3, literalism=3, empathy=3</code></pre>
+      </div>
+      <p>Whereas <strong>directives</strong> are a completely different, <strong>strong</strong> mechanism: a separate table, injected as “hard rules” at <strong>both the start and the end</strong> of the system prompt (recency effect), and structurally enforced in the <code>done</code> tool:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/reflect/prompts.py · build_directives_section (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">parts = ["## DIRECTIVES (MANDATORY)",
+         "These are hard rules you MUST follow in ALL responses:", ""]
+for rule in rules: parts.append(f"- {rule}")
+parts += ["", "NEVER violate these directives, even if other context suggests otherwise.",
+          "IMPORTANT: Do NOT explain or justify how you handled directives ..."]</code></pre>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ The key distinction when teaching this</p>
+        <p><strong>Disposition is soft</strong>: one <code>k=v</code> line, freely interpreted by the model, with <strong>no validation</strong> beyond the 1–5 range — the same values may behave differently across models. <strong>Directive is hard</strong>: MANDATORY section, start-and-end injection, <code>done</code> requires <code>directive_compliance</code>, violations “will be rejected”. In one line: <strong>disposition tunes tone and judgment; directive constrains output.</strong> And directives must be re-injected in the <strong>separate final-synthesis LLM call</strong> (which can't see the agent prompt), or weak models quietly drift back to the default language.</p>
+      </div>
+
+      <h2 id="design">6. Design decisions and pitfalls</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Decision / pitfall</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>why an agent loop, not one-shot</td><td>reflect must <strong>choose and decompose</strong> retrieval; the prompt teaches “don't echo the user's question, decompose it into targeted searches”. A one-shot prompt can't adapt its second search to the first's result</td></tr>
+            <tr><td>evidence before done</td><td>calling <code>done</code> with no retrieved IDs is rejected by a fake tool result: “you must search first”</td></tr>
+            <tr><td>native tool calling, fail loudly</td><td>when the transport doesn't support tools it raises rather than “salvaging the tool-less text” — to avoid emitting raw tool-call JSON as the answer</td></tr>
+            <tr><td>hallucinated-tool / hallucinated-citation defense</td><td>calling a non-enabled tool is rejected; <code>done</code>'s answer text is taken as-is, but <strong>the IDs are validated against what was actually retrieved</strong> (unretrieved IDs are dropped)</td></tr>
+            <tr><td>budget changes three things at once</td><td>the turn multiplier (5/10/20) + a “research depth” prompt section (shallow/moderate/deep) + whether fresh mental models may short-circuit</td></tr>
+            <tr><td>non-conversational</td><td>the prompt forbids follow-up questions / “would you like me to…”, because “the user cannot reply”</td></tr>
+            <tr><td>temporal semantics are prompt-enforced</td><td>“latest <code>mentioned_at</code> wins” and a six-step conflict-resolution scaffold live entirely in the prompt; results are sorted by <strong>semantic relevance, not time</strong>, and the prompt warns the model not to treat position as recency</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+          <li>Reflect = a read-only tool-calling agent loop; context <strong>lazy-loaded</strong> (initial prompt O(1)); hierarchical retrieval (MM &gt; observation &gt; recall), forced first then freed.</li>
+          <li>Tools mostly <strong>reuse recall</strong> (different fact_type filters); <code>expand</code> fetches context; <code>done</code> wraps up and validates citations.</li>
+          <li>mental model = curated result (<code>mental_models</code> table); observation = consolidated (<code>fact_type='observation'</code>, evidence with verbatim quotes).</li>
+          <li><strong>Disposition soft (one k=v line), directive hard (MANDATORY + compliance reporting)</strong> — don't conflate.</li>
+        </ul>
+        <p>Next, the cross-cutting infrastructure: the LLM abstraction and embeddings that every operation stands on — how a dozen providers collapse into one interface.</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

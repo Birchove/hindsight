@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>04 · Fact Extraction &amp; Chunking — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Part 2 · Writing (Retain)</p>
+      <h1>04 · Fact Extraction &amp; Chunking</h1>
+      <p class="lead">Last chapter we walked the Retain skeleton. This one zooms into the most critical step inside the streaming loop: <strong>how text is cut into chunks and how an LLM turns each chunk into atomic facts</strong>. Two designs here look ordinary but have repeatedly caused real bugs — <strong>chunking idempotency</strong>, and <strong>decoupling the extraction prompt from the bank</strong>.</p>
+
+      <div class="keypoints">
+        <h3>Chapter takeaways</h3>
+        <ul>
+          <li><code>chunk_text</code> splits by content type: plain text <strong>sentence-aware</strong>, JSON conversations at <strong>turn boundaries</strong>, JSONL at <strong>line boundaries</strong>.</li>
+          <li>Chunking must be <strong>idempotent</strong> (re-chunking a result yields itself), else streaming's “pre-chunk once, re-chunk during extraction” collides on <code>chunk_id</code> (issue #2301).</li>
+          <li>A “fact” is multi-dimensional: <code>what/when/where/who/why</code> + <code>fact_type</code> + <code>entities</code> + <code>causal_relations</code>, finally joined into one <code>fact_text</code>.</li>
+          <li>The extraction prompt's <strong>system part is deliberately bank-agnostic</strong> (the mission rides in the user message) — purely to <strong>share the LLM cache across banks</strong>.</li>
+          <li><code>chunks</code> mode is the “no LLM” fallback: each whole chunk becomes one fact.</li>
+        </ul>
+      </div>
+
+      <h2 id="two">1. Two sub-problems: how to cut, how to extract</h2>
+      <p>Retain's “extract + embed” lives in <code>engine/retain/fact_extraction.py</code> (~2800 lines, one of the package's largest files — jump by function here too). It solves two sub-problems:</p>
+      <ul>
+        <li><strong>Chunking</strong>: cut possibly large input text into pieces small enough to feed the LLM. Entry point <code>chunk_text</code>.</li>
+        <li><strong>Extraction</strong>: hand each piece to the LLM and extract structured facts. Entry point <code>extract_facts_from_contents</code> (processes several contents in parallel).</li>
+      </ul>
+
+      <h2 id="chunk">2. Chunking: <code>chunk_text</code></h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>engine/retain/fact_extraction.py</code> → <code>chunk_text</code>; branch helpers <code>_chunk_conversation</code>, <code>_chunk_jsonl</code>, <code>_split_oversized_unit</code>.</p>
+      <p>It first decides what kind of input it has, then picks a cutting strategy:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · chunk_text (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = None) -&gt; list[str]:
+    # Small enough: return as one chunk
+    if len(text) &lt;= max_chars:
+        return [text]
+
+    structured_limit = structured_chunk_size if structured_chunk_size is not None else max_chars
+
+    # Try to parse as a JSON conversation array ([{user...}, {assistant...}, ...])
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+
+    if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
+        # It's a conversation - cut at turn boundaries, never split one utterance
+        return _chunk_conversation(parsed, max_chars, structured_limit)
+
+    if isinstance(parsed, dict):
+        # A single JSON object (maybe one JSONL line the producer already kept whole)
+        if len(text) &lt;= structured_limit:
+            return [text]
+        return _split_oversized_unit(text, max_chars)
+
+    # Try JSONL (one JSON object per line, e.g. session logs)
+    jsonl_chunks = _chunk_jsonl(text, max_chars, structured_limit)
+    if jsonl_chunks is not None:
+        return jsonl_chunks
+
+    # Fallback: sentence-aware plain-text splitting
+    return _split_oversized_unit(text, max_chars)</code></pre>
+      </div>
+      <p>Behavior in brief:</p>
+      <ul>
+        <li><strong>Plain text</strong>: sentence-aware (cut at sentence boundaries where possible, not mid-sentence).</li>
+        <li><strong>JSON conversation array</strong>: at <strong>turn boundaries</strong>, never splitting one utterance.</li>
+        <li><strong>JSONL</strong>: at <strong>line boundaries</strong>, one object per line not split.</li>
+        <li>A single utterance/line larger than <code>max_chars</code> is kept whole up to <code>structured_chunk_size</code>, then cut as text.</li>
+      </ul>
+
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ Idempotency: the most important invariant here (issue #2301)</p>
+        <p>The <code>chunk_text</code> docstring says so explicitly: <strong>“the result is idempotent: re-chunking any chunk this returns yields that chunk unchanged.”</strong> Why must it be? Because the streaming pipeline <strong>pre-chunks the whole document once, then re-chunks each piece again during extraction</strong>. If the second pass split a piece further, those sub-chunks would <strong>inherit the same <code>chunk_index</code></strong>, and since <code>chunk_id = {bank}_{doc}_{chunk_index}</code> is a deterministic primary key — collision and corruption. The <code>isinstance(parsed, dict)</code> branch above exists specifically to plug the hole where “an object the producer kept whole falls into plain-text splitting and gets re-cut”, breaking idempotency.</p>
+      </div>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ A general engineering lesson</p>
+        <p>When the same function is <strong>called repeatedly at different pipeline stages</strong>, make it <strong>idempotent</strong>. Otherwise the second call's side effect (here, one more cut) quietly breaks the invariant the first call established. These bugs are very hard to reproduce — they usually surface only at particular input lengths.</p>
+      </div>
+
+      <p>After chunking, the orchestrator <strong>clears the big <code>RetainContent.content</code> string</strong>, keeping only the <code>all_pre_chunks</code> working set — purely for memory (a large document can be several MB × N copies).</p>
+
+      <h2 id="fact-shape">3. What one “fact” looks like</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>fact_extraction.py</code> → <code>ExtractedFact</code> (the default-mode Pydantic schema).</p>
+      <p>The LLM is asked to output several dimensions per fact, not a single sentence:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · ExtractedFact (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">class ExtractedFact(BaseModel):
+    what: str = Field(description="Core fact - concise but complete (1-2 sentences)")
+    when: str = Field(description="When it happened. 'N/A' if unknown.")
+    where: str = Field(description="Location if relevant. 'N/A' if none.")
+    who: str = Field(description="People involved with relationships. 'N/A' if general.")
+    why: str = Field(description="Context/significance if important. 'N/A' if obvious.")
+
+    fact_kind: str = Field(default="conversation", description="'event' or 'conversation'")
+    occurred_start: str | None = Field(default=None, description="ISO timestamp for events")
+    occurred_end: str | None = Field(default=None, description="ISO timestamp for event end")
+    fact_type: Literal["world", "assistant"] = Field(
+        description="'world' = objective/external facts, including user preferences, rules...; "
+                    "'assistant' = actions/experiences the assistant/agent actually performed.")
+    entities: list[str] = Field(default_factory=list,
+        description='People, places, concepts - plain strings, e.g. ["Alice", "Kubernetes"]')
+    causal_relations: list[FactCausalRelation] | None = Field(
+        default=None, description="Links to previous facts (target_index &lt; this fact's index)")
+
+    def build_fact_text(self) -&gt; str:
+        parts = [self.what]
+        if self.who and self.who.upper() != "N/A":
+            parts.append(f"Involving: {self.who}")
+        if self.why and self.why.upper() != "N/A":
+            parts.append(self.why)
+        return " | ".join(parts) if len(parts) &gt; 1 else parts[0]</code></pre>
+      </div>
+
+      <div class="callout concept">
+        <p class="callout-title">📖 The fact_type “dialect”: world/assistant → world/experience</p>
+        <p>Note that at extraction the LLM outputs <code>fact_type</code> as <code>"world"</code> or <code>"assistant"</code>, while ch01 said the database stores <code>world</code> / <code>experience</code>. These are <strong>two names for the same concept</strong>: the prompt uses “assistant” because it fits the model's understanding of “first person = me (the agent)”, and it is mapped to the more general <code>experience</code> on persistence. Don't read the two words as different things.</p>
+      </div>
+
+      <ul>
+        <li><strong><code>entities</code> is a list of plain strings</strong> (e.g. <code>["Alice", "Kubernetes"]</code>), including abstract concepts like “friendship” or “career growth”. These strings are <strong>normalized</strong> into canonical entities in the next chapter — the extraction layer only records “what was mentioned”, not “is this the same entity as an existing one”.</li>
+        <li><strong><code>causal_relations</code> may only point to <em>earlier</em> facts</strong> (<code>target_index &lt; this fact's index</code>, max 2 per fact). This is the source of causal edges; ch05 shows how it becomes a <code>caused_by</code> edge. It references by <strong>in-batch index</strong> rather than ID because at this point the facts aren't persisted yet and have no real ID.</li>
+        <li><strong><code>build_fact_text()</code></strong> joins the dimensions into <strong>one</strong> string (<code>what | Involving: who | why</code>) — and that is what actually lands in <code>memory_units.text</code>, gets embedded, and gets retrieved.</li>
+      </ul>
+
+      <h2 id="prompt">4. Prompt design: why the system part is bank-agnostic</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>fact_extraction.py</code> → <code>_build_extraction_prompt_and_schema</code> (assembles the system prompt + picks the schema); <code>_build_user_message</code> (assembles the per-request user message).</p>
+
+      <h3 id="modes">Extraction modes</h3>
+      <p>The config field <code>retain_extraction_mode</code> chooses which prompt and schema to use:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Mode</th><th>Behavior</th><th>When</th></tr></thead>
+          <tbody>
+            <tr><td><code>concise</code> (default)</td><td>concise multi-dimensional facts</td><td>normal use</td></tr>
+            <tr><td><code>verbose</code></td><td>more detailed facts (the <code>ExtractedFactVerbose</code> schema)</td><td>richer detail needed</td></tr>
+            <tr><td><code>verbatim</code></td><td>preserve the original wording as much as possible; no causal edges</td><td>don't want the model to rewrite</td></tr>
+            <tr><td><code>custom</code></td><td>inject <code>retain_custom_instructions</code></td><td>domain customization</td></tr>
+            <tr><td><code>chunks</code></td><td><strong>no LLM</strong>; the whole chunk is one fact (see §5)</td><td>provider=none / speed-or-cost first</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="cache">Key design: the system prompt is deliberately bank-agnostic</h3>
+      <p>This is the design decision most worth remembering in this chapter. Intuitively the bank's <code>retain_mission</code> (“what this bank cares about”) seems like it belongs in the system prompt. But the source <strong>deliberately does not</strong> do that:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · _build_extraction_prompt_and_schema (comment)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># The per-bank retain mission is NOT baked into this system prompt: it would
+# make the prompt bank-specific and force a separate Gemini context cache per
+# mission (one per bank). Instead the prompt is bank-agnostic so a single
+# CachedContent serves every bank, and the mission rides in the per-request
+# user message via _retain_mission_preamble().</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 Why? To share the cache across banks and save money</p>
+        <p>Gemini (and Anthropic, OpenAI) support <strong>prompt-prefix caching</strong>: an identical prefix is paid for in full once, and later hits are much cheaper. If the mission were in the system prompt, then <strong>every bank's system prompt would differ</strong>, requiring a separate cache per bank — thousands of banks means thousands of caches, and the hit rate collapses. Putting the bank-invariant part (extraction rules, input format, output format) in the cacheable system prompt, and the per-bank mission in the per-request user message, lets <strong>one cache serve all banks</strong>. A textbook case of “reshaping the prompt for cost”.</p>
+      </div>
+
+      <h3 id="narrator">First-person attribution: Narrator vs Context precedence</h3>
+      <p>Extraction also has to resolve who “I” is. <code>_build_user_message</code> injects a Narrator note, and makes <strong>Context take precedence</strong>:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · _build_user_message (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">if agent_name:
+    narrator_section = (
+        f"\nNarrator: {agent_name} (the AI agent whose memory this is). By default, "
+        f'first-person statements like "I did X" are {agent_name}\'s own actions → classify as '
+        f'"assistant".'
+    )
+    if context:
+        narrator_section += (
+            " BUT the Context above takes precedence: if it identifies a different "
+            "first-person speaker (e.g. a user or customer in a transcript), attribute those "
+            'statements to that speaker and classify them as "world", not "assistant".'
+        )</code></pre>
+      </div>
+      <p>Meaning: by default “I did X” is the agent's own action → <code>assistant</code> (i.e. experience); but if the Context shows the speaker is a user/customer, then “I” refers to the user → <code>world</code>. This decides whether the memory is “my experience” or “a fact about the world (the user)”.</p>
+
+      <h2 id="chunks-mode">5. <code>chunks</code> mode: the no-LLM fallback</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>fact_extraction.py</code> → <code>_extract_facts_chunks</code>.</p>
+      <p>When you don't need (or can't use) an LLM, the system takes <code>chunks</code> mode: each chunk directly becomes one <code>world</code> fact, the raw text is the <code>fact_text</code>, and <strong>no entities are extracted</strong>.</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/retain/fact_extraction.py · _extract_facts_chunks (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># chunks mode: no LLM call, no entity extraction.
+# Each chunk becomes one memory unit with the raw text as fact_text.
+for chunk in chunks:
+    extracted_facts.append(ExtractedFactType(
+        fact_text=chunk,
+        fact_type="world",
+        entities=[],          # no entity extraction in this mode
+        content_index=content_index,
+        chunk_index=global_chunk_idx,
+        ...
+    ))</code></pre>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 When is chunks mode forced?</p>
+        <p>When <code>HINDSIGHT_API_LLM_PROVIDER</code> is <code>none</code>, config validation <strong>forces</strong> <code>retain_extraction_mode="chunks"</code> and disables observations — the logic being: with no model, don't pretend you can extract facts; honestly do “vector-search-only” memory. This also makes “no LLM” a runnable, demoable degraded mode.</p>
+      </div>
+
+      <h2 id="failure">6. Failure handling: be loud, but tolerate what's tolerable</h2>
+      <ul>
+        <li><strong>Fail when you should fail</strong>: exhausted retries, protocol errors, etc. must <code>raise</code> (issue #1833) — never return an empty list while marking success, which would silently lose memory (stressed in ch03).</li>
+        <li><strong>Auto-split on output-too-long</strong>: if the model says “output too long” (<code>OutputTooLongError</code>), <code>_extract_facts_with_auto_split</code> splits that chunk in two and extracts each, instead of giving up.</li>
+        <li><strong>Transient errors are retryable</strong>: occasional JSON-parse failures and connection errors retry; but a <strong>deterministic</strong> error like “embedding dimension mismatch” is <strong>not retried</strong> (retrying just burns worker slots for nothing).</li>
+      </ul>
+
+      <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+          <li><code>chunk_text</code> splits by type (text/conversation/JSONL); its core invariant is <strong>idempotency</strong> (issue #2301).</li>
+          <li>A fact is multi-dimensional (<code>what/when/where/who/why + fact_type + entities + causal_relations</code>), finally joined into one <code>fact_text</code>.</li>
+          <li><code>fact_type</code> at extraction is <code>world/assistant</code>; persisted as <code>world/experience</code>.</li>
+          <li>The extraction <strong>system prompt is decoupled from the bank</strong>; the mission rides in the user message — to <strong>share the LLM cache across banks</strong>.</li>
+          <li><code>chunks</code> mode is the no-LLM fallback; failure handling follows “be loud when you should, tolerate when you can”.</li>
+        </ul>
+        <p>Next chapter we see how the extracted entities get <strong>normalized</strong>, how the three edge types get built between facts, and the <strong>Phase1 / Phase2 / Phase3</strong> transaction split designed so slow operations don't hold locks yet retrieval data is atomically visible.</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

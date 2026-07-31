@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Appendix · Source Map &amp; Glossary — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Appendix</p>
+      <h1>A · Source Map &amp; Glossary</h1>
+      <p class="lead">This page is a tool page: find files by role, the jump-functions worth bookmarking, the most-confused concepts, an issue-number quick reference, how to run/debug/read the tests locally, and a glossary. Keep it open while reading source.</p>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ The three most important reading disciplines</p>
+        <p>① <strong>Read by layer</strong>: API adapter → Engine facade → pipeline packages; don't look across layers for a thing. ② <strong>Jump by function</strong>: the two huge files (<code>memory_engine.py</code> ~14k lines, <code>api/http.py</code> ~7.5k lines) are never read in full. ③ <strong>Line numbers drift</strong>: always locate by “file path + function name”; the course's code snippets are excerpted for readability.</p>
+      </div>
+
+      <h2 id="filemap">A. Find files by role</h2>
+      <p>Path prefix: <code>hindsight-api-slim/hindsight_api/</code>.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>File</th><th>One line</th><th>Open when</th></tr></thead>
+          <tbody>
+            <tr><td><code>api/http.py</code></td><td>HTTP models + the operation entries (<code>api_retain</code>/<code>api_recall</code>/<code>api_reflect</code>)</td><td>inputs and routing</td></tr>
+            <tr><td><code>api/mcp.py</code></td><td>MCP server implementation</td><td>MCP integration</td></tr>
+            <tr><td><code>engine/memory_engine.py</code></td><td>the facade, batching, async, worker handler</td><td><strong>jump by function only</strong></td></tr>
+            <tr><td><code>config.py</code> / <code>config_resolver.py</code></td><td>config fields / hierarchical resolution / <code>apply_strategy</code></td><td>config behavior</td></tr>
+            <tr><td><code>engine/retain/orchestrator.py</code></td><td>retain orchestration (document skeleton + streaming)</td><td>main read</td></tr>
+            <tr><td><code>engine/retain/fact_extraction.py</code></td><td>chunking + LLM extraction + prompt</td><td>extraction quality</td></tr>
+            <tr><td><code>engine/retain/fact_storage.py</code> / <code>chunk_storage.py</code></td><td>document/fact persistence / chunk hash storage</td><td>persistence, delta/recovery</td></tr>
+            <tr><td><code>engine/retain/link_utils.py</code> / <code>link_creation.py</code></td><td>edge-building implementation / thin wrapper</td><td>edge algorithms</td></tr>
+            <tr><td><code>engine/retain/types.py</code></td><td>pipeline data structures</td><td>clarify fields</td></tr>
+            <tr><td><code>engine/entity_resolver.py</code></td><td>entity extraction and normalization</td><td>ch05</td></tr>
+            <tr><td><code>engine/search/retrieval.py</code></td><td>four-path retrieval orchestration</td><td>ch06–07</td></tr>
+            <tr><td><code>engine/search/link_expansion_retrieval.py</code></td><td>graph retrieval (link expansion)</td><td>ch07</td></tr>
+            <tr><td><code>engine/search/fusion.py</code> / <code>reranking.py</code> / <code>recall_boost.py</code></td><td>RRF / rerank orchestration / strategy boosts</td><td>ch08</td></tr>
+            <tr><td><code>engine/cross_encoder.py</code></td><td>reranker abstraction (local/TEI/several)</td><td>ch08, 11</td></tr>
+            <tr><td><code>engine/query_analyzer.py</code> / <code>search/temporal_extraction.py</code></td><td>query analysis (temporal constraint)</td><td>ch06</td></tr>
+            <tr><td><code>engine/reflect/agent.py</code> / <code>tools.py</code> / <code>prompts.py</code></td><td>reflect loop / tools / prompt</td><td>ch10</td></tr>
+            <tr><td><code>engine/consolidation/consolidator.py</code> / <code>prompts.py</code></td><td>consolidation job / prompt</td><td>ch09</td></tr>
+            <tr><td><code>engine/llm_wrapper.py</code> / <code>llm_interface.py</code> / <code>providers/</code></td><td>LLM facade / contract / each provider</td><td>ch11</td></tr>
+            <tr><td><code>engine/embeddings.py</code></td><td>embedding abstraction (local/TEI/several)</td><td>ch11</td></tr>
+            <tr><td><code>engine/db/ops_postgresql.py</code></td><td>hand-written asyncpg SQL (authoritative schema usage)</td><td>the real SQL</td></tr>
+            <tr><td><code>alembic/versions/</code></td><td>the schema's authoritative source (~89)</td><td>the real columns</td></tr>
+            <tr><td><code>worker/poller.py</code></td><td>claim tasks / parent aggregation / slot reservation</td><td>async ops</td></tr>
+            <tr><td><code>extensions/memory_defense.py</code></td><td>pre-write defense (ALLOW/REDACT/BLOCK)</td><td>security policy</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="jump">B. Jump-functions worth bookmarking</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Locate</th><th>Read it for</th></tr></thead>
+          <tbody>
+            <tr><td><code>http.py · api_retain / api_recall / api_reflect</code></td><td>how a request becomes an engine call</td></tr>
+            <tr><td><code>memory_engine.py · retain_batch_async / _retain_batch_async_internal</code></td><td>retain guards &amp; batching / entering the orchestrator</td></tr>
+            <tr><td><code>memory_engine.py · submit_async_retain / _handle_batch_retain</code></td><td>async enqueue &amp; idempotency / worker hand-back</td></tr>
+            <tr><td><code>memory_engine.py · _search_with_retries</code></td><td>recall's fusion/rerank/trim orchestration (the body is here)</td></tr>
+            <tr><td><code>memory_engine.py · _filter_by_token_budget</code></td><td>token trim</td></tr>
+            <tr><td><code>retain/orchestrator.py · retain_batch / _streaming_retain_batch</code></td><td>document skeleton / main execution loop</td></tr>
+            <tr><td><code>retain/orchestrator.py · _pre_resolve_phase1 / _insert_facts_and_links / _run_final_semantic_ann / _remap_phase1_results</code></td><td>Phase1/2/3 and placeholder remap</td></tr>
+            <tr><td><code>retain/orchestrator.py · _try_delta_retain</code></td><td>the delta path</td></tr>
+            <tr><td><code>retain/fact_extraction.py · chunk_text / extract_facts_from_contents / _build_extraction_prompt_and_schema / _extract_facts_chunks</code></td><td>chunking / extraction / prompt / chunks mode</td></tr>
+            <tr><td><code>entity_resolver.py · _resolve_from_candidates / reassert_entities_batch</code></td><td>normalization scoring / closing the prune window</td></tr>
+            <tr><td><code>link_utils.py · compute_temporal_links / compute_semantic_links_ann / _write_causal_links_batch / _bulk_insert_links</code></td><td>the three edges + shared writer</td></tr>
+            <tr><td><code>search/retrieval.py · retrieve_all_fact_types_parallel / retrieve_semantic_bm25_combined / retrieve_temporal_combined</code></td><td>four-path orchestration / semantic+BM25 / temporal</td></tr>
+            <tr><td><code>link_expansion_retrieval.py · retrieve</code></td><td>graph expansion</td></tr>
+            <tr><td><code>fusion.py · reciprocal_rank_fusion / interleave_fusion</code></td><td>RRF / round-robin fusion</td></tr>
+            <tr><td><code>reranking.py · CrossEncoderReranker.rerank / apply_combined_scoring</code></td><td>rerank / combined scoring</td></tr>
+            <tr><td><code>query_analyzer.py · DateparserQueryAnalyzer.analyze / _date_match_score</code></td><td>temporal extraction / false-positive guard</td></tr>
+            <tr><td><code>reflect/agent.py · _run_reflect_agent_inner</code></td><td>the reflect loop</td></tr>
+            <tr><td><code>consolidation/consolidator.py · run_consolidation_job / _process_memory_batch / _resolve_obs_tags_list</code></td><td>consolidation main flow / scopes</td></tr>
+            <tr><td><code>config_resolver.py · resolve_full_config / apply_strategy</code></td><td>hierarchical resolution / strategy overlay</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="confuse">C. Most-confused concepts</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Easy to mix up</th><th>Clarification</th></tr></thead>
+          <tbody>
+            <tr><td><code>retain_async</code> vs <code>retain_batch_async</code></td><td>the former is a thin single-item wrapper; the logic is in the latter</td></tr>
+            <tr><td><code>extract_facts_from_contents</code> vs <code>..._batch_api</code></td><td>the latter is the vendor Batch API path, only taken when enabled</td></tr>
+            <tr><td><code>types.ExtractedFact</code> vs the Pydantic models in <code>fact_extraction</code></td><td>pipeline object vs LLM schema, different layers</td></tr>
+            <tr><td>the two <code>generate_embeddings_batch</code></td><td><code>embedding_processing</code> (wrapper) vs <code>embedding_utils</code> (implementation)</td></tr>
+            <tr><td><code>document_tags</code> vs item <code>tags</code></td><td>the former is deprecated; use item-level tags</td></tr>
+            <tr><td>sync split vs async-child split</td><td><code>_split_contents_into_sub_batches</code> vs <code>_split_contents_into_async_children</code>, different constraints</td></tr>
+            <tr><td>fact_type <code>world/assistant</code> vs <code>world/experience</code></td><td>extraction prompt uses the former, persistence maps to the latter (ch04)</td></tr>
+            <tr><td><strong>observation</strong> vs <strong>mental model</strong></td><td>auto-consolidated fact rows vs user-pinned reflect results (separate table) (ch01, 09, 10)</td></tr>
+            <tr><td><strong>disposition</strong> vs <strong>directive</strong></td><td>soft (one k=v line) vs hard (MANDATORY + compliance reporting) (ch10)</td></tr>
+            <tr><td><code>LLMConfig</code></td><td>not a config object — it's an alias for <code>LLMProvider</code> (ch11)</td></tr>
+            <tr><td>“hierarchical LLM config”</td><td>provider/model/key are actually server-level + per-operation, not per-bank (ch11)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="issues">D. The three trade-offs + issue-number quick reference</h2>
+      <p>The <code>#xxxx</code> in source comments mostly correspond to the three trade-offs (ch01) surfacing in real incidents:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Number</th><th>About</th></tr></thead>
+          <tbody>
+            <tr><td>#1875</td><td>sanitize the bad Unicode that would crash the embedder</td></tr>
+            <tr><td>#1833</td><td>extraction failure must be loud, never silent 0-fact success</td></tr>
+            <tr><td>#1888</td><td><code>chunk_index_offset</code> across multi-slice splits, prevent chunk-number collision</td></tr>
+            <tr><td>#2301</td><td>chunking idempotency: re-cutting must not fragment, else <code>chunk_id</code> collides</td></tr>
+            <tr><td>#1795</td><td>an oversized single item isn't split into concurrent siblings; sliced in-process sequentially</td></tr>
+            <tr><td>#1838</td><td><code>document_body_override</code> ensures the full text is stored, not the last slice</td></tr>
+            <tr><td>#1680</td><td>don't inject the narrator when bank_id looks like a routing key</td></tr>
+            <tr><td>#2662</td><td>the Phase1/2 window where an entity is pruned; <code>reassert_entities_batch</code> fixes it</td></tr>
+            <tr><td>#2768</td><td>dateparser false positives; score rather than blacklist</td></tr>
+            <tr><td>#2209</td><td>embedding dimension follows the model; the archive table has no embedding column</td></tr>
+            <tr><td>#2387</td><td>usage stashed before validation; a failed parse was still billed</td></tr>
+            <tr><td>#3002</td><td>the queue stage must be observable, don't debug tasks that never reached the provider</td></tr>
+            <tr><td>#1842</td><td>async-submit dedup locks the bank row <code>FOR NO KEY UPDATE</code></td></tr>
+            <tr><td>#2864</td><td>causal edges are non-regenerable; snapshot on invalidation</td></tr>
+            <tr><td>GH-1558</td><td>label entities match exactly only, never fuzzy-merged</td></tr>
+            <tr><td>#2529</td><td>deadlock retries in the idempotent graph-maintenance sweeps</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="run">E. Run and debug quick reference</h2>
+      <div class="code-block">
+        <div class="code-header"><span>shell</span><span class="lang">bash</span></div>
+        <pre><code class="language-bash"># 1) prepare config
+cp .env.example .env        # set LLM provider/key; with no key set HINDSIGHT_API_LLM_PROVIDER=none
+
+# 2) start the service (repo scripts read .env automatically)
+./scripts/dev/start.sh          # API + console UI
+./scripts/dev/start-api.sh      # API only
+
+# 3) or Docker (ships embedded pg0)
+docker run -it -p 8888:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
+  -v hindsight-data:/home/hindsight/.pg0 ghcr.io/vectorize-io/hindsight:latest
+
+# 4) or Python-embedded (no server)
+pip install hindsight-all -U
+
+# API: http://localhost:8888   UI: http://localhost:9999</code></pre>
+      </div>
+      <p>Common env vars (see <code>.env.example</code> and ch11): <code>HINDSIGHT_API_LLM_PROVIDER</code> (openai/anthropic/gemini/groq/ollama/lmstudio/minimax/<strong>none</strong>), <code>HINDSIGHT_API_LLM_API_KEY</code>, <code>HINDSIGHT_API_LLM_MODEL</code>, <code>HINDSIGHT_API_EMBEDDINGS_PROVIDER</code> (local/tei), <code>HINDSIGHT_API_RERANKER_PROVIDER</code> (local/tei), <code>HINDSIGHT_API_DATABASE_URL</code> (unset → embedded pg0).</p>
+      <div class="callout tip">
+        <p class="callout-title">✅ Debugging tips</p>
+        <p>· <strong>To single-step</strong>: use the process started by <code>start-api.sh</code> (or run <code>hindsight_api.main</code> in your IDE) and breakpoint the orchestrator functions (e.g. <code>_streaming_retain_batch</code>, <code>_search_with_retries</code>).<br>
+        · <strong>To spend nothing</strong>: set provider=<code>none</code> (chunks mode, consolidation off), or run the tests with <code>MockLLM</code> (deterministic, canned by scope). <strong>Reading the code itself needs no key.</strong><br>
+        · <strong>To see the SQL</strong>: the real SQL is in <code>engine/db/ops_postgresql.py</code>; pair with <code>EXPLAIN</code> to understand partial-index hits.</p>
+      </div>
+
+      <h2 id="tests">F. Reading the tests</h2>
+      <p>Test directory <code>hindsight-api-slim/tests/</code>, two kinds:</p>
+      <ul>
+        <li><strong>Deterministic tests (most)</strong>: use <code>MockLLM</code> and pure functions, assert directly. Fastest way to build “expected behavior”: <code>test_delta_retain.py</code>, <code>test_retain_append_mode.py</code>, <code>test_async_batch_retain.py</code>, <code>test_async_retain_operation_id.py</code>, <code>test_retain_same_document_concurrency.py</code>, <code>test_retain_transient_extraction_failure.py</code>.</li>
+        <li><strong>LLM-behavior tests</strong>: when verifying “how the model interprets a prompt”, MockLLM can't simulate it and exact asserts flake across providers. So they use a <strong>real LLM + LLM-as-judge</strong>: mark <code>pytestmark = pytest.mark.hs_llm_core</code>, run the real pipeline, then judge with <code>tests/llm_judge.assert_meets_criteria</code> (the judge model is independent of the provider under test, default Gemini). <strong>Structural</strong> deterministic facts (counts, field presence, a substring injected into a prompt) stay as direct asserts in fast unit tests.</li>
+      </ul>
+      <div class="code-block">
+        <div class="code-header"><span>shell</span><span class="lang">bash</span></div>
+        <pre><code class="language-bash">cd hindsight-api-slim
+uv run pytest tests/ -n auto                 # all tests, parallel
+uv run pytest tests/test_retain.py::test_retain_simple -v   # one test
+uv run ruff check . && uv run ruff format .  # lint/format
+uv run ty check hindsight_api/               # very fast type check
+./scripts/hooks/lint.sh                       # the repo's unified lint (run after Python/TS edits)</code></pre>
+      </div>
+
+      <h2 id="glossary">G. Glossary</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><strong>bank</strong></td><td>one isolated memory store (“a user/agent's brain”); no cross-bank leakage</td></tr>
+            <tr><td><strong>disposition</strong></td><td>a bank's three personality traits (skepticism/literalism/empathy, 1–5); affects only reflect</td></tr>
+            <tr><td><strong>memory_unit</strong></td><td>one atomic fact (a row of the central table)</td></tr>
+            <tr><td><strong>fact_type</strong></td><td>world (the world) / experience (episodic) / observation (consolidated)</td></tr>
+            <tr><td><strong>chunk</strong></td><td>a document slice; deterministic PK <code>{bank}_{doc}_{index}</code></td></tr>
+            <tr><td><strong>entity / canonical_name</strong></td><td>a normalized entity; canonical name first-writer-wins, case-insensitive</td></tr>
+            <tr><td><strong>unit_entities</strong></td><td>the fact↔entity join table</td></tr>
+            <tr><td><strong>memory_links</strong></td><td>typed weighted edges between facts</td></tr>
+            <tr><td><strong>temporal/semantic/causal</strong></td><td>the three edge types: time-close / vector-close / causal (only caused_by written)</td></tr>
+            <tr><td><strong>observation</strong></td><td>a bottom-up consolidated observation (<code>fact_type='observation'</code>)</td></tr>
+            <tr><td><strong>mental model</strong></td><td>a user-defined, on-demand-refreshed pinned reflect result (<code>mental_models</code> table)</td></tr>
+            <tr><td><strong>proof_count / source_memory_ids</strong></td><td>an observation's evidence count / evidence-fact id set</td></tr>
+            <tr><td><strong>observation_scopes</strong></td><td>consolidation granularity: combined/per_tag/all_combinations/shared/custom</td></tr>
+            <tr><td><strong>consolidation</strong></td><td>the background learning: facts → observations</td></tr>
+            <tr><td><strong>RRF</strong></td><td>reciprocal rank fusion, <code>Σ1/(60+rank)</code>, ranks only</td></tr>
+            <tr><td><strong>bi-encoder / cross-encoder</strong></td><td>two-tower (encode separately, cheap) / cross (concatenate and rerank, expensive)</td></tr>
+            <tr><td><strong>HNSW / pgvector</strong></td><td>approximate nearest-neighbor index / Postgres's vector extension</td></tr>
+            <tr><td><strong>delta retain</strong></td><td>incremental write: re-extract only changed chunks (optimistic read + in-txn recheck)</td></tr>
+            <tr><td><strong>streaming mini-batch</strong></td><td>per mini-batch “extract → build edges → commit → release”; anti-OOM, recoverable</td></tr>
+            <tr><td><strong>Phase1/2/3</strong></td><td>slow reads outside txn / short atomic txn / backfill after commit</td></tr>
+            <tr><td><strong>thinking_budget</strong></td><td>recall's top-k/node budget (LOW100/MID300/HIGH~1000)</td></tr>
+            <tr><td><strong>directive</strong></td><td>a hard reflect rule (MANDATORY)</td></tr>
+            <tr><td><strong>narrator</strong></td><td>the “who is the first person” hint injected at extraction</td></tr>
+            <tr><td><strong>pg0</strong></td><td>the embedded PostgreSQL that enables zero dependencies</td></tr>
+            <tr><td><strong>TEI</strong></td><td>HuggingFace Text Embeddings Inference (remote embedding/rerank)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="refs">H. References and notes</h2>
+      <ul>
+        <li><strong>Upstream repo</strong>: <a href="https://github.com/vectorize-io/hindsight" target="_blank" rel="noopener">vectorize-io/hindsight</a> · <a href="https://hindsight.vectorize.io" target="_blank" rel="noopener">official docs</a> · <a href="https://arxiv.org/abs/2512.12818" target="_blank" rel="noopener">paper</a></li>
+        <li><strong>Basis of this course</strong>: an actual reading of this fork's source + cross-checked in depth. Key claims carry source cross-references wherever possible; anything inferred rather than stated in code is flagged in the text.</li>
+        <li><strong>Relation to the in-repo docs</strong>: <code>CLAUDE.md</code> / <code>AGENTS.md</code> at the repo root are the original authors' <strong>development conventions</strong>, not the source of this course; this site takes an independent, teaching-oriented angle. <code>frame/</code> is an earlier, brief Retain-only guide that this site greatly expands.</li>
+        <li><strong>Languages</strong>: this English edition mirrors the Chinese edition (<code>中文</code> in the sidebar). Both are generated from one shared structure (the same CSS, JS, Mermaid, and highlight.js), so adding another language is purely additive — add a language entry plus a folder of translated pages. The site is static and offline-ready: open <code>index.html</code> directly, or <code>python -m http.server</code>.</li>
+      </ul>
+
+      <div class="footer-note">
+        Congratulations on making it here 🎉 You should now be able to open <code>hindsight-api-slim/</code> on your own, jump-read by “layer → function”, and answer “why is this so complex?” for each piece.<br>
+        Back to the <a href="index.html">Course Guide</a> · re-read <a href="ch01-big-picture.html">Chapter 01</a>.
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

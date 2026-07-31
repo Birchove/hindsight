@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>06 · Recall Overview &amp; Query Analysis — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Part 3 · Retrieval (Recall)</p>
+      <h1>06 · Recall Overview &amp; Query Analysis</h1>
+      <p class="lead">From here on we enter the read path. Recall is the source of Hindsight's retrieval quality: it finds memories <strong>four ways at once</strong>, then fuses and reranks. This chapter builds the overall pipeline and clears up a common misunderstanding — the thing called “query analyzer” <strong>actually extracts only one thing: a temporal constraint</strong>. The internals of the four paths and the fusion/rerank stage are chapters 07 and 08.</p>
+
+      <div class="keypoints">
+        <h3>Chapter takeaways</h3>
+        <ul>
+          <li>Recall = <strong>four parallel retrievals (semantic / BM25 / graph / temporal) → fusion → cross-encoder rerank → token trim</strong>.</li>
+          <li>Query analysis is <strong>not an LLM intent classifier</strong>: it only uses <code>dateparser</code> (or a small local T5) to extract a <code>(start_date, end_date)</code> window, which decides whether to run the temporal path at all.</li>
+          <li>“Four-way parallel” is really <strong>batched + selectively parallel</strong>: semantic + BM25 are fused into <strong>one SQL on one connection</strong>; temporal is a second query; only <strong>graph retrieval is truly concurrent per fact_type</strong> (<code>asyncio.gather</code>).</li>
+          <li>Resources are governed by <code>budgeted_operation</code> (connection budget, default 4) + a semaphore + thinking_budget (top-k); each path has its own degradation on failure.</li>
+        </ul>
+      </div>
+
+      <h2 id="why4">1. Why four paths?</h2>
+      <p>Any single retrieval method has blind spots:</p>
+      <ul>
+        <li><strong>Semantic (vector)</strong> is good at “similar meaning” but insensitive to exact keywords (product names, codes).</li>
+        <li><strong>Keyword (BM25)</strong> is good at exact word matches but misses synonymous rephrasings.</li>
+        <li><strong>Graph (link expansion)</strong> finds facts that “semantic/keyword both miss but that are connected through an entity or a cause”.</li>
+        <li><strong>Temporal</strong> specifically answers windowed questions like “what happened in June” or “last week's stuff”.</li>
+      </ul>
+      <div class="callout why">
+        <p class="callout-title">💡 Complementary, then let fusion adjudicate</p>
+        <p>Each path recalls a batch of candidates from a different angle — and each path's scores are on a different scale (cosine similarity, BM25 score, graph activation, temporal proximity). <strong>Fusion</strong> then merges their <strong>ranks</strong> (not their scores), so you never have to force four incommensurable scales onto one axis. That is the motivation for RRF in ch08.</p>
+      </div>
+
+      <h2 id="flow">2. End-to-end flow</h2>
+      <div class="diagram">
+        <div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as api_recall
+  participant E as MemoryEngine._search_with_retries
+  participant R as retrieve_all_fact_types_parallel
+  participant F as fusion + rerank
+  C->>H: POST /banks/id/memories/recall
+  H->>H: validate query token count / default fact_type<br/>parse query_timestamp
+  H->>E: recall_async(query)
+  E->>E: auth / sanitize / resolve thinking_budget
+  E->>E: generate query embedding (stringify)
+  E->>R: four-way retrieval
+  R-->>E: semantic / bm25 / graph / temporal lists
+  E->>E: cap each path by recall_max_candidates_per_source
+  E->>F: RRF fusion -> prefilter 300 -> cross-encoder rerank
+  F-->>E: combined scoring + sort
+  E->>E: cut to thinking_budget*2 -> trim by max_tokens
+  E-->>H: RecallResultModel
+  H-->>C: RecallResponse
+        </div>
+        <div class="diagram-caption">Fig 6-1: the full Recall. Entry is <code>api_recall</code> (api/http.py); the main orchestration actually lives in <code>memory_engine._search_with_retries</code> (fusion/rerank are called there too, not in retrieval.py).</div>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ A locating reminder</p>
+        <p><code>search/retrieval.py</code> only <strong>builds and runs the four paths' SQL and hands the four lists back</strong>; the real <strong>fusion, rerank, and trimming are orchestrated in <code>memory_engine._search_with_retries</code></strong>. To read fusion/rerank, don't look in retrieval.py (there's only a one-line comment mentioning fusion).</p>
+      </div>
+
+      <h2 id="qa">3. Query analysis: only a temporal constraint</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>engine/query_analyzer.py</code>, <code>engine/search/temporal_extraction.py</code>.</p>
+      <p>Many people hear “query analyzer” and assume “an LLM that judges intent, extracts entities, rewrites the query”. <strong>None of that.</strong> Its output has a single optional field:</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/query_analyzer.py · QueryAnalysis</span><span class="lang">python</span></div>
+        <pre><code class="language-python">class QueryAnalysis(BaseModel):
+    """Result of analyzing a natural language query.
+    Contains extracted structured information like temporal constraints."""
+    temporal_constraint: TemporalConstraint | None = Field(
+        default=None, description="Extracted temporal constraint, if any")
+# TemporalConstraint is just start_date + end_date, two datetimes.
+# No intent field, no entity list, no rewritten query.</code></pre>
+      </div>
+      <p>Two implementations exist, <strong>neither</strong> being the configured business LLM:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Implementation</th><th>How</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td><code>DateparserQueryAnalyzer</code> (default)</td><td>pure library + rules: try period extraction (“last week/year”) first, then <code>dateparser.search_dates</code>, <strong>score</strong> every match and keep the strongest</td><td>~10–50ms, no model</td></tr>
+            <tr><td><code>TransformerQueryAnalyzer</code> (opt-in)</td><td>a small local model <code>google/flan-t5-small</code> (~80M); rules first, few-shot generation only for unusual patterns</td><td>small local model</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout why">
+        <p class="callout-title">💡 Why “score” the date matches? (issue #2768)</p>
+        <p><code>dateparser</code> <strong>over-matches</strong>: short common words that happen to be weekday/month abbreviations in <em>some</em> language (“we”/“me”/“did” → a weekday, “do” → Sunday) come back as bogus dates. If such a <strong>false positive appears before the real date</strong> in the query, taking the first match silently produces a <strong>wrong temporal window — worse than none</strong>. So instead of a blacklist, each match is scored by the date signal it actually carries: a digit +100, a month/relative word +50, a weekday +30, a period word +20; <strong>a bare token scores 0 and is rejected</strong>.</p>
+      </div>
+      <p>Query analysis runs <strong>before any database work</strong>; its output decides “whether to run the temporal path at all”. Any <code>dateparser</code> exception is swallowed into “no constraint” — a parser bug must never bring down the whole retrieval.</p>
+
+      <h2 id="parallel">4. The real shape of “four-way parallel”</h2>
+      <p>The module bills itself as “4-way parallel search”, but the concrete orchestration is <strong>batched + selectively parallel</strong>, not four independent concurrent tasks:</p>
+      <div class="diagram">
+        <div class="mermaid">
+flowchart TB
+  A["1 temporal extraction (CPU, no DB)"] --> B
+  B["2 semantic + BM25: fused into one SQL<br/>(same connection, sequential)"]
+  B --> C["3 temporal retrieval: a second query on the same connection<br/>(only if a constraint exists)"]
+  B --> D["4 graph retrieval: one task per fact_type<br/>asyncio.gather, truly concurrent"]
+  C --> D
+  D --> E["aggregate per fact_type"]
+        </div>
+        <div class="diagram-caption">Fig 6-2: the only true concurrency is the graph step. Semantic and BM25 are interleaved arms of one SQL statement, so they execute “together”; temporal reuses the same connection.</div>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 Why don't semantic and BM25 each get a connection?</p>
+        <p>Two reasons: <strong>(1)</strong> asyncpg forbids concurrent queries on one connection; <strong>(2)</strong> making semantic and BM25 <strong>interleaved UNION ALL arms of one SQL</strong> gets both in a single round trip — a <strong>deliberate optimization</strong> (comment: “reduces connection usage from 2 to 1”). Temporal reuses the same connection for the same reason. Only graph retrieval (one independent connection per fact_type) uses <code>asyncio.gather</code> for real concurrency, and it <strong>depends on the seeds the semantic phase produced</strong> (ch07), so it can only run after semantic.</p>
+      </div>
+
+      <h3 id="resource">Resource control (defaults from config.py)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Control</th><th>Default</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>recall_connection_budget</code></td><td>4</td><td>max concurrent DB connections per recall (<code>budgeted_operation</code>)</td></tr>
+            <tr><td><code>_search_semaphore</code></td><td>—</td><td>backpressure around the whole search</td></tr>
+            <tr><td><code>semantic_min_similarity</code> / <code>graph_seed_min_similarity</code></td><td>0.3 / 0.3</td><td>semantic / graph-seed similarity gate</td></tr>
+            <tr><td><code>temporal_semantic_min_similarity</code></td><td>0.1</td><td>temporal entry gate</td></tr>
+            <tr><td><code>link_expansion_timeout</code></td><td>10s</td><td>graph query timeout (<code>asyncio.wait_for</code>)</td></tr>
+            <tr><td><code>thinking_budget</code></td><td>LOW100/MID300/HIGH~1000</td><td>top-k / node budget; resolved from the <code>budget</code> enum</td></tr>
+            <tr><td><code>recall_max_candidates_per_source</code></td><td>0 (off)</td><td>per-path cap before fusion, so one over-expanding path can't crowd out the others</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="fault">What happens when one path fails</h3>
+      <ul>
+        <li><strong>Graph</strong>: <code>asyncio.wait_for</code> timeout → degrade to “semantic + causal only” (drop the expensive entity self-join). No seeds → that fact_type returns empty (graph just contributes nothing).</li>
+        <li><strong>BM25 (Oracle)</strong>: full-text index not synced (<code>DRG-10599</code> etc.) → the whole query is <strong>rebuilt as semantic-only</strong>.</li>
+        <li><strong>Temporal</strong>: no constraint → the whole path is skipped; no pool rows → <code>{ft: []}</code>; Oracle lacks <code>unnest</code> → spreading is skipped but entry points still return.</li>
+        <li><strong>Connection-level</strong>: connection errors retry 3× with exponential backoff; but a <strong>client-disconnect cancellation is never retried</strong> — it's re-raised.</li>
+      </ul>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ asyncio.gather has no return_exceptions</p>
+        <p>The graph retrieval's <code>asyncio.gather</code> is called <strong>without</strong> <code>return_exceptions=True</code>. So an unexpected exception in one graph task <strong>propagates and fails the whole recall</strong> (caught upstream by the retry/500 logic), rather than being silently swallowed. In other words: at the gather layer, a failing path is not “quietly dropped” — usually good (no silence), but it also means one path's surprise crash drags down the entire retrieval.</p>
+      </div>
+
+      <h2 id="types">5. Key data structures</h2>
+      <p>The four paths' unified carrier is <code>RetrievalResult</code> (<code>search/types.py</code>): it carries the memory payload (id/text/fact_type/time/tags/proof_count/…) plus <strong>several per-source score slots of which only one is set per source</strong>:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Set by</th></tr></thead>
+          <tbody>
+            <tr><td><code>similarity</code></td><td>semantic path</td></tr>
+            <tr><td><code>bm25_score</code></td><td>keyword path</td></tr>
+            <tr><td><code>activation</code></td><td>graph path (the summed multi-signal score)</td></tr>
+            <tr><td><code>temporal_score</code> / <code>temporal_proximity</code></td><td>temporal path</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Above that sit aggregates: <code>SemanticBm25Result</code> (per-fact_type semantic/bm25/graph seeds), <code>ParallelRetrievalResult</code> (the four lists + per-path timings + temporal constraint), <code>MultiFactTypeRetrievalResult</code> (the per-fact_type dict + aggregate timings). The post-fusion <code>MergedCandidate</code> and post-rerank <code>ScoredResult</code> are in ch08.</p>
+
+      <div class="callout tip">
+        <p class="callout-title">✅ Cancellation is cooperative</p>
+        <p>After a client disconnects, the engine checks <code>request_context.raise_if_cancelled()</code> at <strong>stage boundaries</strong>. So a retrieval can still be “mid-query” when the client leaves — cancellation isn't a hard kill; it takes effect at the next checkpoint. The most expensive cross-encoder stage checks once specifically before it runs (ch08).</p>
+      </div>
+
+      <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+          <li>Recall = four complementary paths (semantic/BM25/graph/temporal) → fusion → rerank → trim.</li>
+          <li>Query analysis <strong>only extracts a temporal constraint</strong> (dateparser + scoring against false positives, or a small local T5) — not an LLM intent classifier.</li>
+          <li>Real parallelism: semantic+BM25 one SQL, temporal one SQL, graph per fact_type via <code>gather</code>; connection budget 4.</li>
+          <li>Each path has a degradation on failure; gather does not swallow exceptions.</li>
+        </ul>
+        <p>Next chapter, each path opened up: semantic's HNSW over-fetch, BM25's tsvector, the graph's link-expansion algorithm, and temporal's “entry points + spreading activation”.</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

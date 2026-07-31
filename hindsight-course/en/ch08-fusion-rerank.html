@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>08 · Fusion &amp; Reranking — Hindsight Source Deep-Dive</title>
+  <link rel="stylesheet" href="../assets/css/course.css">
+  <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
+</head>
+<body>
+  <button id="nav-toggle" aria-label="Menu">☰</button>
+  <div id="overlay"></div>
+  <nav id="sidebar"></nav>
+  <main id="content">
+    <article class="chapter">
+
+      <p class="eyebrow">Part 3 · Retrieval (Recall)</p>
+      <h1>08 · Fusion &amp; Reranking</h1>
+      <p class="lead">The four paths each hand back a ranked list. This chapter covers the “merge → rerank → trim” trio: <strong>Reciprocal Rank Fusion (RRF)</strong> combines the four incommensurable rankings into one; a <strong>cross-encoder</strong> reranks the survivors; then a token budget trims it to the final answer. Two classic exam questions live here: why RRF, and why “fuse first, rerank after”.</p>
+
+      <div class="keypoints">
+        <h3>Chapter takeaways</h3>
+        <ul>
+          <li><strong>RRF looks only at ranks, not scores</strong>: <code>score(d) = Σ 1/(k+rank)</code>, <code>k=60</code>. No scales to align, no weights to tune.</li>
+          <li><strong>The cross-encoder is expensive, so RRF pre-filters to 300 before reranking</strong> — this is the pipeline's cost gate.</li>
+          <li>The rerank score is the <strong>primary</strong> signal, then <strong>multiplied</strong> by recency / temporal / proof boosts (each centered at a neutral 0.5 → ×1.0) to get the final order.</li>
+          <li>Trimming happens twice: first cut the count to <code>thinking_budget×2</code>, then by <code>max_tokens</code> (tiktoken), <strong>stopping before the overflowing fact</strong> — never splitting a fact.</li>
+        </ul>
+      </div>
+
+      <h2 id="map">1. Where the code is</h2>
+      <p>The pure algorithms are in <code>search/fusion.py</code>, <code>search/reranking.py</code>, <code>search/recall_boost.py</code>; but the <strong>orchestration</strong> (who's first, the pre-filter, the trim) is in <code>memory_engine._search_with_retries</code>. Pipeline at a glance:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Step</th><th>What</th></tr></thead>
+          <tbody>
+            <tr><td>2</td><td>the four paths return ranked lists; optional per-path cap (<code>cap_per_source</code>)</td></tr>
+            <tr><td>3</td><td><strong>fusion</strong>: RRF (default) or round-robin interleave</td></tr>
+            <tr><td>4</td><td>pre-filter by (boosted) RRF score down to <code>reranker_max_candidates</code> → cross-encoder rerank</td></tr>
+            <tr><td>4.6</td><td>combined scoring = CE × recency × temporal × proof + strategy boost; final sort</td></tr>
+            <tr><td>5</td><td>cut the count to <code>thinking_budget×2</code></td></tr>
+            <tr><td>6</td><td>token trim to <code>max_tokens</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="rrf">2. RRF: reciprocal rank fusion</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>search/fusion.py</code> → <code>reciprocal_rank_fusion(result_lists, k=60)</code>.</p>
+      <p>Formula: <code>score(d) = Σ_lists 1/(k + rank(d))</code>, <code>k=60</code> (the classic Cormack/Clarke/Buettcher constant), ranks 1-based.</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/search/fusion.py · reciprocal_rank_fusion (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">rrf_scores[doc_id] += 1.0 / (k + rank)
+source_ranks[doc_id][f"{source_name}_rank"] = rank
+
+# The merged result keeps only the FIRST arm's RetrievalResult,
+# so record each arm's raw score separately into ArmScores for downstream reporting/filtering.
+if source_name == "semantic" and retrieval.similarity is not None:
+    arm_scores[doc_id].semantic = retrieval.similarity
+elif source_name == "bm25" and retrieval.bm25_score is not None:
+    arm_scores[doc_id].keyword = retrieval.bm25_score
+
+# Finally sort by RRF score descending; rrf_rank is assigned 1-based in that order.
+for rrf_rank, (doc_id, rrf_score) in enumerate(
+    sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True), start=1):
+    merged_results.append(MergedCandidate(
+        retrieval=all_retrievals[doc_id], rrf_score=rrf_score,
+        rrf_rank=rrf_rank, source_ranks=..., arm_scores=...))</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 Why RRF rather than a weighted sum?</p>
+        <p>The four paths' raw scores are <strong>on completely incommensurable scales</strong>: cosine similarity in [0,1], BM25 with no upper bound, graph activation in [0,3], temporal proximity yet another. A weighted sum would first need careful normalization onto one scale, plus tuned weights. RRF uses <strong>only ranks</strong> — “where you placed in your own path” — so there are <strong>no weights to tune and no scales to align</strong>, and it's naturally robust to one score type blowing up. Hence “parameter-free fusion”.</p>
+      </div>
+      <ul>
+        <li><strong>The dedup key is the document id</strong>; a fact appearing in several paths accumulates RRF score, but <strong>the merged result keeps only the first arm's payload</strong> (raw scores kept separately via <code>ArmScores</code>).</li>
+        <li><strong><code>cap_per_source</code></strong>: before fusion you can cap each path to its top-<code>cap</code>, so one over-expanding path can't crowd out the others (default 0 = off).</li>
+      </ul>
+      <div class="callout concept">
+        <p class="callout-title">📖 There's also an interleave mode, built to fix an RRF weakness</p>
+        <p>RRF scores by the <strong>sum</strong> of reciprocal ranks across arms, so a result that is #1 in one arm but absent/low in the others <strong>gets averaged down</strong>. This bit consolidation dedup: a “twin” result almost identical to an existing observation, ranked #1 by semantic, was buried by RRF/rerank outside the budget, so the model never saw it and created a duplicate. <code>interleave_fusion</code> uses <strong>round-robin</strong> to guarantee each arm's top gets a slot (and skips the later combined-scoring re-sort). Consolidation uses interleave specifically for this reason (ch09).</p>
+      </div>
+
+      <h2 id="ce">3. Cross-encoder reranking</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>search/reranking.py</code>'s <code>CrossEncoderReranker</code>; the model abstraction is <code>cross_encoder.py</code>'s <code>CrossEncoderModel</code>.</p>
+      <div class="callout concept">
+        <p class="callout-title">📖 First, bi-encoder vs cross-encoder</p>
+        <p>A <strong>bi-encoder</strong> (what the semantic path uses) encodes query and doc <strong>independently</strong> into vectors, then compares — cheap, doc vectors can be precomputed, so it can recall from millions fast. But it never lets query and doc “meet”, so precision is limited. A <strong>cross-encoder</strong> feeds <code>[query, document]</code> <strong>concatenated</strong> through one transformer and outputs a single relevance score — far more accurate, but <strong>doc vectors can't be precomputed, so it's O(n) forward passes per candidate</strong>, expensive. This cost asymmetry determines the whole pipeline shape: the cheap bi-encoder recalls broadly, the expensive cross-encoder reranks only the small set.</p>
+      </div>
+      <p>When building the <code>[query, doc]</code> pairs, the doc text is <code>context + ": " + text</code>, and a <strong>formatted date is prepended</strong> for temporal awareness: <code>f"[Date: {date_readable} ({date_iso})] {doc_text}"</code>. All pairs go into one <code>cross_encoder.predict(pairs)</code> call.</p>
+      <h3 id="norm">Normalization is conditional</h3>
+      <div class="code-block">
+        <div class="code-header"><span>engine/search/reranking.py · rerank (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">scores = await self.cross_encoder.predict(pairs)
+
+# External API rerankers (Cohere, Jina, ...) return calibrated relevance_score already in [0,1]
+# -- pass through unchanged, preserving absolute confidence (a 0.007 candidate should stay low,
+# not be inflated to 1.0 by rank normalization). Local models return logits (any real number)
+# -- sigmoid maps them to (0,1).
+if scores and min(scores) &gt;= 0.0 and max(scores) &lt;= 1.0:
+    normalized_scores = list(scores)          # already calibrated, pass through
+else:
+    normalized_scores = [1 / (1 + np.exp(-s)) for s in scores]   # sigmoid</code></pre>
+      </div>
+      <h3 id="backends">Two backends: local vs TEI</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Backend</th><th>Implementation notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>local</code> (default)</td><td>sentence-transformers <code>CrossEncoder</code>, default model <code>cross-encoder/ms-marco-MiniLM-L-6-v2</code>; runs in a dedicated thread pool; <strong>bucket batching</strong> (sort pairs by length so short ones aren't padded to the longest — 36–54% speedup, identical quality)</td></tr>
+            <tr><td><code>tei</code> (remote)</td><td>HTTP to HuggingFace TEI <code>/rerank</code>; grouped by query, batched (default 128), <code>asyncio.gather</code> concurrent but gated by a <strong>class-level global semaphore</strong> (default 8) — across all parallel recalls, to prevent a thundering herd</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The provider is dispatched by <code>create_cross_encoder_from_env()</code> from <code>reranker_provider</code>, supporting local/tei/cohere/openrouter/flashrank/litellm/google/alibaba/<code>rrf</code> (passthrough)/jina-mlx, etc. <strong>There is no score cache</strong> — every recall re-scores its candidates (only FlashRank caches model weights on disk).</p>
+
+      <h2 id="order">4. Pipeline order: fuse first, then rerank, on the pre-filtered set</h2>
+      <div class="code-block">
+        <div class="code-header"><span>engine/memory_engine.py · _search_with_retries Step 4 (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python"># Pre-filter candidates by RRF before the (optional) cross-encoder.
+# RRF already provides good ranking; this caps cross-encoder cost.
+if len(merged_candidates) &gt; reranker_max_candidates:      # default 300
+    merged_candidates.sort(key=lambda mc: boosted_rrf_score(mc, strategy_boosts), reverse=True)
+    merged_candidates = merged_candidates[:reranker_max_candidates]
+
+if reranking == "cross_encoder":
+    # Cancellation checkpoint: the cross-encoder rerank is the single most CPU-expensive
+    # stage and runs in a worker thread that can't be interrupted once dispatched. If the
+    # client already disconnected, skip it rather than burning ~2 CPUs for nothing.
+    if request_context is not None:
+        request_context.raise_if_cancelled()
+    scored_results = await reranker_instance.rerank(query, merged_candidates)</code></pre>
+      </div>
+      <h3 id="combined">Final order: CE primary, three multiplicative boosts</h3>
+      <p><code>apply_combined_scoring</code> treats the cross-encoder score as the <strong>primary</strong> signal, then <strong>multiplies</strong> by three boosts, each centered at a neutral 0.5 (missing signal = ×1.0):</p>
+      <div class="code-block">
+        <div class="code-header"><span>engine/search/reranking.py · apply_combined_scoring (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">recency_boost     = 1.0 + recency_alpha     * (sr.recency - 0.5)    # alpha=0.2
+temporal_boost    = 1.0 + temporal_alpha    * (sr.temporal - 0.5)   # alpha=0.2
+proof_count_boost = 1.0 + proof_count_alpha * (proof_norm - 0.5)    # alpha=0.1
+sr.combined_score = (sr.cross_encoder_score_normalized
+                     * recency_boost * temporal_boost * proof_count_boost)
+sr.weight = sr.combined_score</code></pre>
+      </div>
+      <div class="callout why">
+        <p class="callout-title">💡 Why multiplicative rather than additive?</p>
+        <p>Multiplication guarantees these <strong>secondary signals' influence is always proportional to the base relevance</strong> — a candidate with a low CE score won't be lifted by being “new” no matter what; and it's robust to different cross-encoder calibrations (different models score on different scales). At the default alphas the boosts swing at most about +21%/−19%: enough to nudge, not enough to overpower.</p>
+      </div>
+      <div class="callout concept">
+        <p class="callout-title">📖 recall_boost: weighting a path in two places, on two scales</p>
+        <p>A deployment can prioritize one path (e.g. <code>HINDSIGHT_API_RECALL_STRATEGY_BOOSTS=graph:high</code>). It takes effect in <strong>two structurally different places</strong>: ① <strong>before</strong> the rerank cap, a “weighted RRF” (rank-aware) keeps the boosted path's candidates from being cut at the 300-mark; ② <strong>after</strong> the rerank, a flat additive is added to the final <code>weight</code>, nudging the boosted path's candidates up the delivered order.</p>
+      </div>
+
+      <h2 id="trim">5. Token-budget trimming</h2>
+      <p>Two ordered cuts:</p>
+      <ol>
+        <li><strong>By count</strong>: <code>top_scored = scored_results[: thinking_budget * 2]</code>. <code>thinking_budget</code> is resolved from the <code>budget</code> enum (default 100/300/1000, or adaptive from <code>max_tokens</code>).</li>
+        <li><strong>By token</strong>: <code>_filter_by_token_budget</code> uses tiktoken <code>cl100k_base</code>, counts <strong>only the <code>text</code> field</strong>, accumulates in ranked order, and <strong>breaks the moment the next result would overflow</strong> — dropping the rest, <strong>not splitting a fact</strong>:</li>
+      </ol>
+      <div class="code-block">
+        <div class="code-header"><span>engine/memory_engine.py · _filter_by_token_budget (excerpt)</span><span class="lang">python</span></div>
+        <pre><code class="language-python">for result in results:
+    text_tokens = len(encoding.encode(result.get("text", "")))
+    if total_tokens + text_tokens &lt;= max_tokens:     # default 4096
+        filtered_results.append(result)
+        total_tokens += text_tokens
+    else:
+        break          # stop before the overflowing fact</code></pre>
+      </div>
+      <div class="callout gotcha">
+        <p class="callout-title">⚠️ Chunks are a separate budget, and they get truncated</p>
+        <p>If <code>include_chunks</code>, chunks use an independent <code>max_chunk_tokens</code> budget (default 8192), fetched <strong>before</strong> the fact token filter; and unlike facts, the <strong>last chunk is truncated to fit</strong> (rather than dropped). Consequence: <code>max_tokens=0</code> yields 0 facts but can still return chunks.</p>
+      </div>
+
+      <h2 id="knobs">6. Main config knobs</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Knob</th><th>Default</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>reranker_provider</code></td><td>local</td><td>rerank backend</td></tr>
+            <tr><td><code>reranker_local_model</code></td><td>ms-marco-MiniLM-L-6-v2</td><td>local CE weights</td></tr>
+            <tr><td><code>reranker_max_candidates</code></td><td>300</td><td>pre-filter size before CE (the cost gate)</td></tr>
+            <tr><td><code>reranker_local_batch_size</code> / <code>tei_batch_size</code> / <code>tei_max_concurrent</code></td><td>32 / 128 / 8</td><td>batch sizes and backpressure</td></tr>
+            <tr><td><code>recall_max_candidates_per_source</code></td><td>0 (off)</td><td>per-path cap before fusion</td></tr>
+            <tr><td><code>recall_strategy_boosts</code></td><td>""</td><td>e.g. <code>graph:high</code></td></tr>
+            <tr><td>request-level <code>reranking</code></td><td>cross_encoder</td><td>cross_encoder / rrf / interleave</td></tr>
+            <tr><td>request-level <code>max_tokens</code></td><td>4096</td><td>token budget</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="gotchas">7. Pitfalls</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Pitfall</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td><code>k=60</code> duplicated and must match</td><td>RRF and <code>boosted_rrf_score</code> each hard-code <code>k=60</code>; drifting them silently breaks the boost math</td></tr>
+            <tr><td>passthrough reranker (<code>rrf</code> provider)</td><td>all CE scores identical; the code seeds the CE score from RRF rank via an explicit flag, else it'd degenerate into a pure-recency sort</td></tr>
+            <tr><td>fusion keeps only the first arm's payload</td><td>changing the arms' order changes the payload (not the order)</td></tr>
+            <tr><td>token trim counts only <code>text</code></td><td>not context, not the date string the CE saw; stops before overflow, never splits a fact</td></tr>
+            <tr><td>no score cache</td><td>reranking is fully recomputed every query</td></tr>
+            <tr><td>RRF ties</td><td>broken by stable-sort insertion order (first appearance), no secondary score</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="summary">
+        <h2>Summary</h2>
+        <ul>
+          <li><strong>RRF</strong>: parameter-free fusion on ranks only, <code>Σ1/(60+rank)</code>, dedup by id.</li>
+          <li><strong>cross-encoder</strong>: feeds query+doc together to rerank, expensive; so <strong>RRF pre-filters to 300 first</strong>; normalization treats “calibrated vs logits” differently.</li>
+          <li><strong>combined scoring</strong>: CE primary × recency × temporal × proof (multiplicative, neutral at 0.5).</li>
+          <li><strong>trim</strong>: first <code>thinking_budget×2</code> by count, then by token stopping before overflow; chunks on a separate budget.</li>
+        </ul>
+        <p>Recall is fully read. Next we enter the “learning” step: how background consolidation synthesizes and updates these scattered facts into observations.</p>
+      </div>
+
+    </article>
+    <div id="pager"></div>
+  </main>
+  <script src="../assets/js/mermaid.min.js"></script>
+  <script src="../assets/js/highlight.min.js"></script>
+  <script src="../assets/js/course.js"></script>
+</body>
+</html>

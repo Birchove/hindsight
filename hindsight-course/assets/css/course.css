@@ -145,7 +145,7 @@ a:hover { text-decoration: underline; }
   border-top: 1px solid var(--border);
   display: flex; gap: 8px;
 }
-.nav-tools button {
+.nav-tools button, .nav-tools a {
   flex: 1;
   font: inherit; font-size: 13px;
   padding: 7px 8px;
@@ -154,8 +154,9 @@ a:hover { text-decoration: underline; }
   background: var(--bg-elev);
   color: var(--text);
   cursor: pointer;
+  text-align: center; text-decoration: none; line-height: 1.2;
 }
-.nav-tools button:hover { border-color: var(--accent); color: var(--accent-text); }
+.nav-tools button:hover, .nav-tools a:hover { border-color: var(--accent); color: var(--accent-text); text-decoration: none; }
 
 /* mobile nav toggle */
 #nav-toggle {
