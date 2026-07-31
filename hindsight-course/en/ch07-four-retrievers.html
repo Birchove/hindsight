@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>07 · The Four Retrievers — Hindsight Source Deep-Dive</title>
+  <title>07 · The Four Retrievers — Reading Hindsight's Source</title>
   <link rel="stylesheet" href="../assets/css/course.css">
   <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
 </head>
@@ -14,23 +14,23 @@
   <main id="content">
     <article class="chapter">
 
-      <p class="eyebrow">Part 3 · Retrieval (Recall)</p>
+      <p class="eyebrow">Part 3 · Retrieval — Recall</p>
       <h1>07 · The Four Retrievers</h1>
-      <p class="lead">Last chapter saw the pipeline skeleton. This one opens each path up: how <strong>semantic</strong> walks the vectors, how <strong>BM25</strong> does full-text, how <strong>graph</strong> expands from seeds, how <strong>temporal</strong> does “entry + spreading”. Each path has a detail worth remembering — HNSW over-fetch, the graph's additive scoring, and the counter-intuitive choice to rank temporal entry points <strong>by similarity rather than by time</strong>.</p>
+      <p class="lead">Last chapter we saw the pipeline skeleton. This chapter opens each arm one by one: how <strong>semantic</strong> does vectors, how <strong>BM25</strong> does full-text, how <strong>graph</strong> expands from seeds, how <strong>temporal</strong> does “entry + spreading”. Each arm has an engineering detail worth remembering — HNSW over-fetch, the graph arm's “additive scoring”, and the counter-intuitive choice in temporal retrieval to <strong>rank by similarity rather than by time</strong>.</p>
 
       <div class="keypoints">
         <h3>Chapter takeaways</h3>
         <ul>
-          <li>All four paths read <code>memory_units</code>, all filter by <code>bank_id</code> + fact_type + tags, all return <code>list[RetrievalResult]</code>.</li>
-          <li><strong>Semantic</strong>: one UNION ALL arm per fact_type to hit the partial indexes; HNSW is approximate, so it <strong>over-fetches 5× then trims in Python</strong>.</li>
-          <li><strong>BM25</strong>: default native tsvector + <code>ts_rank_cd</code>; if the query has no tokens, the whole path is skipped.</li>
-          <li><strong>Graph</strong>: <strong>not multi-hop BFS</strong> — “one SQL round trip from semantic seeds, expanded through three link signals”, scored by <strong>summing across signals</strong> to reward convergent evidence.</li>
+          <li>All four arms read <code>memory_units</code>, all filter by <code>bank_id</code> + fact_type + tags, all return <code>list[RetrievalResult]</code>.</li>
+          <li><strong>Semantic</strong>: one UNION ALL arm per fact_type to hit the partial indexes; HNSW is approximate, so <strong>over-fetch 5× then trim in Python</strong>.</li>
+          <li><strong>BM25</strong>: default native tsvector + <code>ts_rank_cd</code>; if the query has no word tokens the whole arm is skipped.</li>
+          <li><strong>Graph</strong>: <strong>not multi-hop BFS</strong> — a bounded single-SQL expansion from semantic seeds through three link signals, scoring <strong>additively across signals</strong> to reward convergent evidence.</li>
           <li><strong>Temporal</strong>: first pick “entry points” (by similarity, covering the whole window), then <strong>spreading activation</strong> along temporal/causal edges (this step is the BFS-like one).</li>
         </ul>
       </div>
 
-      <h2 id="semantic">1. Semantic path: vector similarity</h2>
-      <p class="src-ref"><strong>Locate</strong>: SQL built by <code>engine/sql/postgresql.py</code>'s <code>build_semantic_arm</code>; executed in <code>search/retrieval.py</code>'s <code>retrieve_semantic_bm25_combined</code>.</p>
+      <h2 id="semantic">1. Semantic arm: vector similarity</h2>
+      <p class="src-ref"><strong>Locate</strong>: the SQL is built by <code>build_semantic_arm</code> in <code>engine/sql/postgresql.py</code>; execution in <code>retrieve_semantic_bm25_combined</code> in <code>search/retrieval.py</code>.</p>
       <p>Similarity uses pgvector's cosine-distance operator <code>&lt;=&gt;</code>, expressed as <code>1 - distance</code>:</p>
       <div class="code-block">
         <div class="code-header"><span>engine/sql/postgresql.py · build_semantic_arm (excerpt)</span><span class="lang">sql</span></div>
@@ -47,16 +47,16 @@
  LIMIT {fetch_limit})</code></pre>
       </div>
       <div class="callout why">
-        <p class="callout-title">💡 Two key design choices</p>
-        <p><strong>(1) One UNION ALL arm per fact_type</strong> rather than one big query with a window function <code>ROW_NUMBER() PARTITION BY fact_type</code>. Why? Because with the <code>fact_type = '...'</code> filter the planner walks the <strong>per-fact_type partial HNSW index</strong> (the <code>idx_mu_emb_*</code> from ch02); the window-function form used to force a full sequential scan.<br>
-        <strong>(2) HNSW over-fetch</strong>: HNSW is <strong>approximate</strong> nearest neighbor, so a plain <code>LIMIT k</code> can miss the truly good results. So each arm fetches <code>hnsw_fetch = max(limit*5, 100)</code>, <strong>over-fetching 5× and trimming back to limit in Python</strong>. At connection init <code>ef_search=200</code> is also set to improve recall.</p>
+        <p class="callout-title">💡 Two key design points</p>
+        <p><strong>(1) One UNION ALL arm per fact_type</strong>: rather than one big query using the window function <code>ROW_NUMBER() PARTITION BY fact_type</code>. Why? Because with the <code>fact_type = '...'</code> filter the planner uses the <strong>per-fact_type partial HNSW indexes</strong> (the <code>idx_mu_emb_*</code> set from chapter 02); the window-function form used to force a full sequential scan.<br>
+        <strong>(2) HNSW over-fetch</strong>: HNSW is <strong>approximate</strong> nearest neighbor, so a direct <code>LIMIT k</code> might miss the truly good results. Each arm therefore fetches <code>hnsw_fetch = max(limit*5, 100)</code>, <strong>over-fetching 5× and trimming back to limit in Python</strong>. At connection init <code>ef_search=200</code> is also set to improve recall.</p>
       </div>
       <div class="callout tip">
-        <p class="callout-title">✅ Bonus: semantic results are reused by the graph path</p>
-        <p>If the semantic threshold ≤ <code>graph_seed_min_similarity</code>, the ordered semantic rows <strong>double as the graph retrieval's entry seeds</strong> (capped at 20), saving the graph path from doing another ANN query. This is the concrete form of ch06's “graph depends on semantic”.</p>
+        <p class="callout-title">✅ Also: the semantic results are reused by the graph arm</p>
+        <p>If the semantic threshold ≤ <code>graph_seed_min_similarity</code>, the sorted semantic rows <strong>double as the graph retriever's entry seeds</strong> (capped at 20), saving the graph arm a second ANN query. This is the concrete form of “graph depends on semantic” from chapter 06.</p>
       </div>
 
-      <h2 id="bm25">2. Keyword path: BM25 / full-text</h2>
+      <h2 id="bm25">2. Keyword arm: BM25 / full-text</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>build_bm25_arm</code> (same file).</p>
       <p>The default backend is <strong>native tsvector</strong>, ranking with <code>ts_rank_cd</code> and gating matches with <code>@@</code>:</p>
       <div class="code-block">
@@ -71,32 +71,32 @@
  ORDER BY bm25_score DESC
  LIMIT {limit})</code></pre>
       </div>
-      <p>Query terms are joined with <code>|</code> (OR) by <code>prepare_bm25_text</code>. Key points:</p>
+      <p>Query terms are joined with <code>|</code> (OR) by <code>prepare_bm25_text</code>. Notes:</p>
       <ul>
-        <li><strong>No tokens → the whole path is skipped</strong>: <code>tokenize_query</code> strips punctuation and splits on whitespace; a purely symbolic query yields no tokens, so <strong>no BM25 arms are generated at all</strong> (which also changes the bind-parameter layout).</li>
-        <li><strong>The backend is swappable</strong>: besides native tsvector it supports <code>pg_search</code> (ParadeDB), <code>pgroonga</code>, <code>vchord</code>, <code>pg_textsearch</code>. <code>_pg_search.py</code> is only a ParadeDB index-DDL helper, not on the query path.</li>
+        <li><strong>No tokens → the whole arm is skipped</strong>: <code>tokenize_query</code> strips punctuation and splits on whitespace; a purely symbolic query yields no tokens, so <strong>no BM25 arms are generated at all</strong> (it also changes the bind-parameter layout).</li>
+        <li><strong>Backend is swappable</strong>: besides native tsvector it also supports <code>pg_search</code> (ParadeDB), <code>pgroonga</code>, <code>vchord</code>, <code>pg_textsearch</code>. <code>_pg_search.py</code> is only the ParadeDB index-DDL helper, not on the query path.</li>
         <li><strong>Oracle fallback</strong>: if <code>CONTAINS</code> errors because the index isn't synced, the whole query is <strong>rebuilt as semantic-only</strong>.</li>
       </ul>
 
-      <h2 id="graph">3. Graph path: link expansion</h2>
-      <p class="src-ref"><strong>Locate</strong>: <code>search/link_expansion_retrieval.py</code>'s <code>LinkExpansionRetriever</code> (the default graph retriever).</p>
+      <h2 id="graph">3. Graph arm: link expansion</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>LinkExpansionRetriever</code> in <code>search/link_expansion_retrieval.py</code> (the default graph retriever).</p>
       <div class="callout concept">
         <p class="callout-title">📖 It is not multi-hop BFS</p>
-        <p>The name has “expansion” in it, so it's tempting to picture “a graph traversal expanding layer by layer”. In reality it is a <strong>bounded, single-SQL-round-trip expansion</strong>: starting from the semantic seeds, it finds neighbors through the three link signals that were built at Retain time. Those three signals were <strong>bounded in size at write time</strong>, so no deep traversal is needed at query time.</p>
+        <p>The name has “expansion”, which invites imagining “a graph traversal that expands layer by layer”. In fact it's a <strong>bounded, single-SQL-round-trip expansion</strong>: starting from the semantic seeds, it finds neighbors through the three link signals built at Retain time. Those three signals were <strong>bounded in size at write time</strong>, so no deep traversal is needed at query time.</p>
       </div>
-      <p>Three link signals, each a CTE, finally <code>UNION ALL</code>-ed into <strong>one query on one connection</strong>:</p>
+      <p>The three link signals each have a CTE, <code>UNION ALL</code>-ed into <strong>one query on one connection</strong>:</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Signal</th><th>Source</th><th>Score</th></tr></thead>
           <tbody>
-            <tr><td><strong>entity</strong></td><td>query-time self-join on <code>unit_entities</code> (shared entities)</td><td><code>COUNT(DISTINCT entity_id)</code>, with a LATERAL per-entity cap of 200</td></tr>
-            <tr><td><strong>semantic</strong></td><td>the precomputed kNN graph (<code>memory_links</code> with <code>link_type='semantic'</code>), checked <strong>both directions</strong> (the graph isn't symmetric)</td><td><code>MAX(weight)</code></td></tr>
-            <tr><td><strong>causal</strong></td><td><code>causes/caused_by/enables/prevents</code></td><td><code>weight</code> (boosted as the highest-quality signal)</td></tr>
+            <tr><td><strong>Entity</strong></td><td>Query-time self-join through <code>unit_entities</code> (shared entities)</td><td><code>COUNT(DISTINCT entity_id)</code>, per-entity LATERAL cap 200</td></tr>
+            <tr><td><strong>Semantic</strong></td><td>The precomputed kNN graph in <code>memory_links</code> (<code>link_type='semantic'</code>), checked <strong>both directions</strong> (the graph isn't symmetric)</td><td><code>MAX(weight)</code></td></tr>
+            <tr><td><strong>Causal</strong></td><td><code>causes/caused_by/enables/prevents</code></td><td><code>weight</code> (boosted as the highest-quality signal)</td></tr>
           </tbody>
         </table>
       </div>
       <div class="code-block">
-        <div class="code-header"><span>engine/db/ops_postgresql.py · entity expansion CTE (excerpt)</span><span class="lang">sql</span></div>
+        <div class="code-header"><span>engine/db/ops_postgresql.py · the entity-expansion CTE (excerpt)</span><span class="lang">sql</span></div>
         <pre><code class="language-sql">entity_expanded AS (
   SELECT mu.id, ...,
          COUNT(DISTINCT se.entity_id)::float AS score,   -- number of shared entities
@@ -109,7 +109,7 @@
         AND ue_target.unit_id != ALL($1::uuid[])          -- exclude the seeds themselves
         AND EXISTS (SELECT 1 FROM memory_units mu_target
                     WHERE mu_target.id = ue_target.unit_id
-                      AND mu_target.fact_type = $2)        -- filter before capping
+                      AND mu_target.fact_type = $2)        -- filter before the cap
       ORDER BY ue_target.unit_id DESC
       LIMIT 200                                            -- per-entity cap
   ) t
@@ -119,34 +119,34 @@
   LIMIT $3
 )</code></pre>
       </div>
-      <h3 id="graph-score">Additive scoring: reward convergent evidence</h3>
-      <p>A fact may be hit by several signals at once. On merge the scores are <strong>summed across signals</strong> (total lands in [0,3]):</p>
+      <h3 id="graph-score">Additive scoring: reward “convergent evidence”</h3>
+      <p>A fact can be hit by several signals at once. On merge the scores are <strong>added across signals</strong> (total in [0,3]):</p>
       <ul>
         <li>entity → <code>tanh(shared_count × 0.5)</code> (1 shared → 0.46, 2 → 0.76, saturating);</li>
         <li>semantic → max link weight;</li>
         <li>causal → max link weight.</li>
       </ul>
       <div class="callout why">
-        <p class="callout-title">💡 Why sum rather than take the max?</p>
-        <p>If a fact <strong>both</strong> shares entities with the query <strong>and</strong> has a semantic edge <strong>and</strong> a causal edge, its evidence is “convergent” and it should rank above something that only hit one path. Summation lets that <strong>multi-evidence</strong> accumulate. The final summed score is stored in <code>RetrievalResult.activation</code> — and note it must be the <strong>summed</strong> score, not a single-signal score, or cross-fact_type ordering would disagree with within-graph ordering.</p>
+        <p class="callout-title">💡 Why add rather than take the max?</p>
+        <p>If a fact <strong>both</strong> shares an entity with the query, <strong>and</strong> has a semantic edge, <strong>and</strong> has a causal edge, the evidence for it is “converging” — it should rank above a fact hit by only one arm. Adding lets this <strong>multiple evidence</strong> accumulate. The final additive score is stored in <code>RetrievalResult.activation</code> — note it must be the <strong>additive</strong> score, not a single-signal one, else cross-fact_type ordering would disagree with within-graph ordering.</p>
       </div>
       <div class="callout gotcha">
         <p class="callout-title">⚠️ Timeout degradation and the observation special path</p>
-        <p>The whole graph query is wrapped in <code>asyncio.wait_for(timeout=10s)</code>; <strong>on timeout it degrades to semantic + causal only</strong> (drops the expensive entity self-join). Also, observations have no direct entity links, so they take a separate <code>_expand_observations</code>: via <code>source_memory_ids → world facts → entities → other world facts → their observations</code>.</p>
+        <p>The whole graph query is wrapped in <code>asyncio.wait_for(timeout=10s)</code>; <strong>on timeout it degrades to semantic+causal only</strong> (dropping the most expensive entity self-join). Also, observations have no direct entity links, so they take a separate <code>_expand_observations</code>: via <code>source_memory_ids → world facts → entities → other world facts → their observations</code>.</p>
       </div>
 
-      <h2 id="temporal">4. Temporal path: entry points + spreading activation</h2>
-      <p class="src-ref"><strong>Locate</strong>: <code>search/retrieval.py</code>'s <code>retrieve_temporal_combined</code>. <strong>Runs only when query analysis found a temporal constraint.</strong></p>
+      <h2 id="temporal">4. Temporal arm: entry points + spreading activation</h2>
+      <p class="src-ref"><strong>Locate</strong>: <code>retrieve_temporal_combined</code> in <code>search/retrieval.py</code>. <strong>Runs only when query analysis found a temporal constraint.</strong></p>
       <p>Two phases:</p>
 
       <h3 id="entry">Phase one: pick entry points (by similarity, not by time!)</h3>
-      <p>One “similarity-ranked + window-filtered” arm per fact_type, first pulling a pool (<code>_TEMPORAL_POOL_SIZE = 60</code>), then narrowing to <code>_TEMPORAL_ENTRY_POINTS = 10</code> per fact_type — and those 10 must <strong>cover the whole window</strong> (round-robin across 8 time buckets, so they don't all cluster at one end):</p>
+      <p>One “similarity-ranked + window-filtered” arm per fact_type first gathers a pool (<code>_TEMPORAL_POOL_SIZE = 60</code>), then narrows it to <code>_TEMPORAL_ENTRY_POINTS = 10</code> per fact_type, and those 10 must <strong>cover the whole window</strong> (selected round-robin across 8 time buckets so they don't all bunch at one end):</p>
       <div class="code-block">
-        <div class="code-header"><span>search/retrieval.py · one temporal entry-point arm (excerpt)</span><span class="lang">sql</span></div>
+        <div class="code-header"><span>search/retrieval.py · a temporal entry-point arm (excerpt)</span><span class="lang">sql</span></div>
         <pre><code class="language-sql">(SELECT {pool_cols}, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
  FROM memory_units
  WHERE bank_id = $2 AND fact_type = 'world' AND embedding IS NOT NULL
-   AND (   -- window match: occurred range or mentioned_at within [start,end]
+   AND (   -- window match: occurred range or mentioned_at falls in [start,end]
         (occurred_start IS NOT NULL AND occurred_end IS NOT NULL
          AND occurred_start &lt;= $4 AND occurred_end &gt;= $3)
      OR (mentioned_at IS NOT NULL AND mentioned_at BETWEEN $3 AND $4)
@@ -157,12 +157,12 @@
  LIMIT 60)</code></pre>
       </div>
       <div class="callout why">
-        <p class="callout-title">💡 Why “rank by similarity” rather than “rank by recency”?</p>
-        <p>An earlier version ranked entry points by date, which <strong>biased results toward the end of the window</strong>; and on banks with dense/uniform dates it degenerated into “a near-random sample + a full scan + a disk-spilling sort” — 30+ seconds on a 660k-row bank. Switching to <strong>ranking by similarity</strong> (via the ANN index) + using buckets to guarantee time coverage is both fast and balanced.</p>
+        <p class="callout-title">💡 Why “pick by similarity”, not “by recency”?</p>
+        <p>An earlier version ranked by date to pick entry points, which <strong>biased results toward the end of the window</strong>; and on banks with dense/uniform dates it degenerated into “a near-random sample + a full scan + a disk-spilling sort” — 30+ seconds on a 660k-row bank. Switching to <strong>ranking by similarity</strong> (going through the ANN index) + buckets for temporal coverage is both fast and balanced.</p>
       </div>
 
       <h3 id="spread">Phase two: spreading activation (this step is the BFS-like one)</h3>
-      <p>From the entry points, a bounded multi-hop expansion along <strong>temporal/causal edges</strong> (frontier + visited set + budget, <code>max_iterations=5</code>):</p>
+      <p>From the entry points, do bounded multi-hop spreading along <strong>temporal/causal edges</strong> (frontier + visited + budget, <code>max_iterations=5</code>):</p>
       <div class="code-block">
         <div class="code-header"><span>search/retrieval.py · one spreading hop (excerpt)</span><span class="lang">sql</span></div>
         <pre><code class="language-sql">SELECT src.from_unit_id, mu.id, ..., l.weight, l.link_type,
@@ -184,18 +184,18 @@ WHERE mu.bank_id = $6 AND mu.fact_type = $3 AND mu.embedding IS NOT NULL
       <p>Each neighbor gets a <code>temporal_proximity</code> (1.0 at the window midpoint → 0.0 at the edges) and a <strong>propagated score</strong> = parent score × edge weight × causal boost × 0.7 (causal boost: causes/caused_by = 2.0, enables/prevents = 1.5). Take <code>max(proximity, propagated)</code>; neighbors above 0.2 re-enter the frontier.</p>
       <div class="callout gotcha">
         <p class="callout-title">⚠️ Spreading is skipped on Oracle</p>
-        <p>Spreading uses <code>unnest</code> / LATERAL, which Oracle has no equivalent for, so <strong>on Oracle spreading is skipped</strong> (but entry points still return). When temporal results are empty they're normalized to <code>None</code> (meaning “no temporal path”), distinct from <code>[]</code>.</p>
+        <p>Spreading uses <code>unnest</code> / LATERAL, for which Oracle has no equivalent, so <strong>on Oracle spreading is skipped</strong> (but entry points still return). When temporal results are empty they're normalized to <code>None</code> (meaning “no temporal arm”), distinct from <code>[]</code>.</p>
       </div>
 
       <div class="summary">
         <h2>Summary</h2>
         <ul>
-          <li><strong>Semantic</strong>: per-fact_type arms hit the partial indexes; HNSW over-fetches 5× then trims; gate 0.3; results reusable as graph seeds.</li>
-          <li><strong>BM25</strong>: native tsvector + <code>ts_rank_cd</code>; no tokens → skipped; swappable backend; Oracle fallback to semantic-only.</li>
-          <li><strong>Graph</strong>: bounded single-SQL expansion, three link signals (entity/semantic/causal) with <strong>additive scoring</strong>; timeout degrades; observations take a detour.</li>
-          <li><strong>Temporal</strong>: entry points chosen by similarity (buckets cover the window) + spreading activation along temporal/causal edges; Oracle skips spreading.</li>
+          <li><strong>Semantic</strong>: per-fact_type arms hit the partial indexes; HNSW over-fetches 5× then trims; gate 0.3; results can double as graph seeds.</li>
+          <li><strong>BM25</strong>: native tsvector + <code>ts_rank_cd</code>; no tokens → skipped; swappable backend; Oracle falls back to semantic-only.</li>
+          <li><strong>Graph</strong>: bounded single-SQL expansion, three link signals (entity/semantic/causal) scored <strong>additively</strong>; timeout degrades; observations take a detour.</li>
+          <li><strong>Temporal</strong>: pick entry points by similarity (buckets cover the window) + spreading activation along temporal/causal edges; Oracle skips spreading.</li>
         </ul>
-        <p>Each path hands back a ranked list. Next we see how they're <strong>fused</strong> (RRF), <strong>reranked</strong> (cross-encoder), and finally trimmed to a token budget for the answer.</p>
+        <p>Each arm hands back one ranked list. Next chapter we see how they're <strong>fused</strong> (RRF), <strong>reranked</strong> (cross-encoder), and finally trimmed by token budget into the answer.</p>
       </div>
 
     </article>

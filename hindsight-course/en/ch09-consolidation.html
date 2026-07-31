@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>09 · Consolidation: Facts to Observations — Hindsight Source Deep-Dive</title>
+  <title>09 · Consolidation: Facts to Observations — Reading Hindsight's Source</title>
   <link rel="stylesheet" href="../assets/css/course.css">
   <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
 </head>
@@ -14,23 +14,23 @@
   <main id="content">
     <article class="chapter">
 
-      <p class="eyebrow">Part 4 · Reasoning &amp; Consolidation</p>
+      <p class="eyebrow">Part 4 · Reasoning & Consolidation</p>
       <h1>09 · Consolidation: Facts to Observations</h1>
-      <p class="lead">Hindsight claims it “learns, not just remembers”. That learning happens in <strong>consolidation</strong>: a background job that runs after Retain and <strong>synthesizes and updates</strong> scattered world/experience facts into observations. This chapter covers how it works, why it can't be folded into Retain, and why it is almost obsessive about <strong>tags</strong>.</p>
+      <p class="lead">Hindsight claims it “learns, not just remembers”. That “learning” happens in <strong>consolidation</strong>: a background job that runs after Retain and <strong>synthesizes / updates</strong> scattered world/experience facts into observations. This chapter covers how it works, why it can't happen inline in Retain, and why it's almost paranoid about tags.</p>
 
       <div class="keypoints">
         <h3>Chapter takeaways</h3>
         <ul>
-          <li>Consolidation is the <strong>bottom-up “learning”</strong>: facts → observation (a <code>memory_units</code> row with <code>fact_type='observation'</code>). It is <strong>not</strong> the <code>mental_models</code> table (that's user-defined, refreshed on demand).</li>
-          <li><strong>Decoupled from Retain</strong>: Retain commits in streamed chunks, so mid-way there's no “full fact set”; consolidation is also expensive; decoupled, it can also resume after a crash.</li>
+          <li>Consolidation is <strong>bottom-up “learning”</strong>: facts → observation (a <code>memory_units</code> row with <code>fact_type='observation'</code>). It is <strong>not</strong> the <code>mental_models</code> table (that's user-defined, refreshed on demand).</li>
+          <li>It's <strong>decoupled from Retain</strong>: Retain commits in streamed chunks so there's no “full fact set” mid-flight; consolidation is also expensive; decoupling also makes it crash-resumable.</li>
           <li>The work queue is just a SQL predicate: <code>consolidated_at IS NULL AND fact_type IN ('experience','world')</code>.</li>
-          <li>Core policy: <strong>prefer UPDATE over CREATE</strong> (one observation with many evidence facts &gt; a pile of twins with one each); <strong>tags are a security boundary</strong> — facts with different tags never share one LLM call.</li>
-          <li>When a source changes: <strong>delete the observation + reset <code>consolidated_at</code></strong>, so the surviving facts re-consolidate next round.</li>
+          <li>Core policy: <strong>prefer UPDATE over CREATE</strong> (one observation with many evidence facts &gt; a pile of twins each with one); <strong>tags are a security boundary</strong> — facts with different tags never share one LLM call.</li>
+          <li>When a source changes, <strong>delete the observation + reset <code>consolidated_at</code></strong> so the facts re-consolidate next round.</li>
         </ul>
       </div>
 
       <h2 id="what">1. What consolidation does, and why it's separate from Retain</h2>
-      <p>Retain is the <strong>recording</strong> pipeline: extract facts, persist them, and stamp each fact with an <code>observation_scopes</code> directive — but <strong>synthesize nothing</strong>. Consolidation is the separate <strong>learning</strong> pipeline: read a batch of unconsolidated facts and produce/update observation rows (carrying <code>proof_count</code>, the evidence set <code>source_memory_ids</code>, and a <code>history</code> of changes).</p>
+      <p>Retain is a <strong>recording</strong> pipeline: extract facts, store them, and stamp each fact with an <code>observation_scopes</code> directive — but <strong>synthesize nothing</strong>. Consolidation is the separate <strong>learning</strong> pipeline: read a batch of unconsolidated facts and produce/update observation rows (carrying <code>proof_count</code> support count, <code>source_memory_ids</code> evidence set, <code>history</code> change log).</p>
       <div class="code-block">
         <div class="code-header"><span>engine/consolidation/consolidator.py · module docstring</span><span class="lang">python</span></div>
         <pre><code class="language-python"># NOTE: Observations are distinct from mental models (pinned reflections).
@@ -40,22 +40,22 @@
 #   refreshed on demand via reflect</code></pre>
       </div>
       <div class="callout why">
-        <p class="callout-title">💡 Why not consolidate inside Retain?</p>
-        <p><strong>(1) No full set exists</strong>: Retain commits in streamed chunks; half-way through there is no “all facts for this document”, yet observations need to aggregate across chunks and documents. <strong>(2) Cost</strong>: consolidation is LLM-heavy (recall + synthesis + optional dedup adjudication); shoving it into Retain couples write latency to synthesis; separate, it runs in the worker pool on its own concurrency budget and can use a <strong>bank-agnostic cacheable prompt prefix</strong> to save money. <strong>(3) Re-runnable</strong>: progress is marked per fact (<code>consolidated_at</code>), failures quarantined (<code>consolidation_failed_at</code>), so a crash or a half-run simply resumes where it left off.</p>
+        <p class="callout-title">💡 Why not consolidate inline in Retain?</p>
+        <p><strong>(1) No complete set</strong>: Retain commits in streamed chunks, so halfway through there's no “all the facts for this document”, yet observations need to aggregate across chunks and documents. <strong>(2) Cost</strong>: consolidation is LLM-heavy (recall + synthesis + optional dedup adjudication); folding it into Retain would couple write latency to synthesis; separated, it can run on the worker pool with its own concurrency budget and exploit a <strong>bank-agnostic cacheable prompt prefix</strong> to save money. <strong>(3) Re-runnable</strong>: progress is marked per fact (<code>consolidated_at</code>), failures quarantined (<code>consolidation_failed_at</code>), so a crash or a half-run simply resumes where it left off.</p>
       </div>
 
       <h2 id="scopes">2. observation_scopes: at what granularity to consolidate</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>consolidator.py</code> → <code>_resolve_obs_tags_list</code>.</p>
-      <p>At Retain time each content item can carry an <code>observation_scopes</code>, deciding “group these facts into observations by what tag scope”:</p>
+      <p>At Retain time each content item can carry an <code>observation_scopes</code> that decides “group these facts into observations by what tag scope”:</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Value</th><th>Meaning</th></tr></thead>
           <tbody>
-            <tr><td><code>combined</code> (default / None)</td><td>one consolidation pass using the fact's <strong>full tag set</strong> as a single scope</td></tr>
-            <tr><td><code>per_tag</code></td><td><strong>one pass per individual tag</strong>: tags <code>[a, b]</code> feed scope <code>{a}</code> and scope <code>{b}</code> separately</td></tr>
-            <tr><td><code>all_combinations</code></td><td>one pass per non-empty subset of the tags: <code>{a}</code>, <code>{b}</code>, <code>{a,b}</code></td></tr>
-            <tr><td><code>shared</code></td><td>one pass over the <strong>empty</strong> scope: the produced observation carries <strong>no tags</strong> and matches with <code>tags_match="any"</code> — every fact consolidates into one global observation (for dedup across volatile provenance tags)</td></tr>
-            <tr><td>explicit <code>list[list[str]]</code></td><td>one pass per inner tag list — full caller control</td></tr>
+            <tr><td><code>combined</code> (default/None)</td><td>Use the fact's <strong>full tag set</strong> as one scope, one consolidation pass</td></tr>
+            <tr><td><code>per_tag</code></td><td><strong>One pass per individual tag</strong>: tags <code>[a, b]</code> contribute to scope <code>{a}</code> and scope <code>{b}</code> separately</td></tr>
+            <tr><td><code>all_combinations</code></td><td>One pass per non-empty subset of the tags: <code>{a}</code>, <code>{b}</code>, <code>{a,b}</code></td></tr>
+            <tr><td><code>shared</code></td><td>One pass over the <strong>empty</strong> scope: the produced observation carries <strong>no tags</strong> and is matched with <code>tags_match="any"</code> — every fact consolidates into one global observation (used to dedup across volatile provenance tags)</td></tr>
+            <tr><td>explicit <code>list[list[str]]</code></td><td>One pass per inner tag list — full caller control</td></tr>
           </tbody>
         </table>
       </div>
@@ -73,7 +73,7 @@ if parsed == "combined" or parsed is None:
     return None                      # default: use the fact's own tags
 return parsed                        # explicit list[list[str]]</code></pre>
       </div>
-      <p>There's also <code>_resolve_write_scopes</code>, which returns the same scopes as <code>frozenset</code>s so the <strong>parallel dispatcher can take one async lock per scope</strong>: two tag-groups whose write-scopes overlap serialize on the shared scope (preventing a race on the same observation row); disjoint groups run concurrently. Lock acquisition follows a total order, specifically to be <strong>deadlock-free</strong>.</p>
+      <p>There's also <code>_resolve_write_scopes</code>, which returns the same scopes as <code>frozenset</code>s so the <strong>parallel dispatcher can take one async lock per scope</strong>: two tag groups whose write-scope sets overlap serialize on the shared scope (instead of racing on the same observation row); disjoint groups run concurrently. Lock acquisition order is a total order, specifically to be <strong>deadlock-free</strong>.</p>
 
       <h2 id="job">3. The consolidation job flow</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>consolidator.py</code> → <code>run_consolidation_job</code> / <code>_run_consolidation_job</code> / <code>_process_memory_batch</code>.</p>
@@ -81,20 +81,20 @@ return parsed                        # explicit list[list[str]]</code></pre>
         <div class="mermaid">
 flowchart TB
   A["work queue: SQL predicate<br/>consolidated_at IS NULL<br/>AND fact_type IN (experience,world)"] --> B[fetch a batch]
-  B --> C["group by exact tag set<br/>(security: different tags never share one LLM call)"]
+  B --> C["group by EXACT tag set<br/>(security: different tags never share an LLM call)"]
   C --> D[split into LLM batches]
   D --> E["each batch: _process_memory_batch"]
-  E --> E1["1 parallel recall per fact for related observations"]
-  E1 --> E2["2 union + dedup observations across batch (by id)"]
+  E --> E1["1 per-fact parallel recall of related observations"]
+  E1 --> E2["2 union across the batch, dedup by id"]
   E2 --> E3["3 one LLM call: N facts + unioned observations"]
-  E3 --> E4["4 execute actions sequentially<br/>delete first, then update, then create"]
-  E4 --> F["mark consolidated_at = NOW()<br/>on failure mark consolidation_failed_at"]
+  E3 --> E4["4 sequential action execution<br/>delete first, then update, then create"]
+  E4 --> F["mark consolidated_at=NOW()<br/>on failure mark consolidation_failed_at"]
   F --> B
         </div>
         <div class="diagram-caption">Fig 9-1: the consolidation job's core loop. “Group by exact tag set” is called a security requirement in the source.</div>
       </div>
       <div class="code-block">
-        <div class="code-header"><span>engine/consolidation/consolidator.py · fetch and group (excerpt)</span><span class="lang">python</span></div>
+        <div class="code-header"><span>engine/consolidation/consolidator.py · fetch & group (excerpt)</span><span class="lang">python</span></div>
         <pre><code class="language-python">memories = await conn.fetch(f"""
     SELECT id, text, fact_type, ..., observation_scopes
     FROM memory_units
@@ -107,77 +107,77 @@ flowchart TB
 if not memories:
     break
 
-# Group by exact tag set -- security requirement: facts with different tags
+# Group by exact tag set — security requirement: facts with different tags
 # must never share one LLM call.
 tag_groups: dict[tuple[str, ...], list[dict]] = {}
 for m in memories:
     tag_key = tuple(sorted(m.get("tags") or []))
     tag_groups.setdefault(tag_key, []).append(dict(m))</code></pre>
       </div>
-      <p>Inside each LLM batch: <strong>① recall related observations per fact in parallel</strong> (it reuses recall, but limited to <code>fact_type=["observation"]</code>, <code>tags_match="all_strict"</code>, <code>reranking="interleave"</code>); ② union + dedup across the batch; ③ <strong>one LLM call</strong> over N facts + those observations; ④ execute the write actions <strong>sequentially</strong> (writes must be serial for consistency). Execution order is <strong>delete first</strong> (free observation slots) then update then create. Failure handling uses <strong>adaptive bisection</strong>: a failed batch is halved and retried down to a single fact; only a single-fact failure gets stamped <code>consolidation_failed_at</code>.</p>
+      <p>Inside each LLM batch: <strong>① per-fact parallel recall of related observations</strong> (reusing recall, but limited to <code>fact_type=["observation"]</code>, <code>tags_match="all_strict"</code>, <code>reranking="interleave"</code>); ② union across the batch, dedup; ③ <strong>one LLM call</strong> handling N facts + those observations; ④ <strong>sequential</strong> write actions (writes stay serial for consistency). Execution order is <strong>deletes first</strong> (free observation slots) then updates then creates. Failure handling uses <strong>adaptive bisection</strong>: a failed batch is split in half and retried down to a single memory; only a single-memory failure gets stamped <code>consolidation_failed_at</code>.</p>
 
-      <h2 id="prompt">4. The prompt: a template for “don't let the model be stupid”</h2>
+      <h2 id="prompt">4. The prompt: a model for “keeping the model from being stupid”</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>consolidation/prompts.py</code>.</p>
-      <p>The prompt is split into a <strong>bank-agnostic, cacheable system prefix</strong> and a per-batch user message — the same money-saving idea as the extraction prompt in ch04:</p>
+      <p>The prompt is split into a <strong>bank-agnostic, cacheable system prefix</strong> and a per-batch user message — the same money-saving idea as the extraction prompt in chapter 04:</p>
       <div class="code-block">
         <div class="code-header"><span>engine/consolidation/prompts.py · build_consolidation_system_prompt (comment)</span><span class="lang">python</span></div>
         <pre><code class="language-python"># Holds only what is constant across banks: processing rules, input format,
 # decision guide, and output format. The bank's MISSION is deliberately NOT
-# here -- baking it in would make the prefix bank-specific and force a separate
+# here — baking it in would make the prefix bank-specific and force a separate
 # Gemini context cache per mission. ... so this prefix is identical for every
 # bank and a single CachedContent serves them all.</code></pre>
       </div>
-      <p>A few processing rules are especially worth remembering (they target exactly where models misbehave):</p>
+      <p>A few processing rules are especially worth remembering (all places the model tends to err):</p>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Rule</th><th>Gist</th></tr></thead>
+          <thead><tr><th>Rule</th><th>The gist, in the model's words</th></tr></thead>
           <tbody>
-            <tr><td><strong>prefer UPDATE over CREATE</strong></td><td>if the new facts describe the same canonical event/claim an existing observation already covers, <strong>update it and attach the new facts as evidence; don't create a near-duplicate sibling</strong>. “One canonical observation with many source facts is always better than many siblings with one source fact each.”</td></tr>
-            <tr><td>one observation per facet</td><td>a count, an entity, a relation — never merged.</td></tr>
-            <tr><td>state changes update</td><td>“sold X”, “X died”, “moved to Y” → update the matching observation to the current state.</td></tr>
-            <tr><td>preserve history</td><td>observations recording significant events are important history — <strong>never delete them</strong>; be very conservative with deletes.</td></tr>
-            <tr><td><strong>no computation</strong></td><td>“you don't have the full picture — never calculate, derive, or adjust numeric values. If the user says ‘I have 2 dogs’ then ‘I have a dog named Rex’, <strong>don't</strong> change the count to 3 — you don't know if Rex is one of the 2.”</td></tr>
+            <tr><td><strong>Prefer UPDATE over CREATE</strong></td><td>If new facts describe the same canonical event/statement already covered by an existing observation, <strong>UPDATE it and attach the new facts as evidence — don't create a near-duplicate sibling</strong>. “One canonical observation with many source facts is always better than many siblings with one source fact each.”</td></tr>
+            <tr><td>One observation per facet</td><td>A count, an entity, a relationship — never merged.</td></tr>
+            <tr><td>State changes update</td><td>“sold X”, “X died”, “moved to Y” → update the matching observation to reflect current state.</td></tr>
+            <tr><td>Preserve history</td><td>Observations recording significant events are important history — <strong>never delete them</strong>; deletes must be very conservative.</td></tr>
+            <tr><td><strong>No computation</strong></td><td>“You don't have the full picture — never calculate, derive, or adjust numeric values. If the user says ‘I have 2 dogs’ then ‘I have a dog named Rex’, <strong>don't</strong> change the count to 3 — you don't know if Rex is one of the 2 or a new one.”</td></tr>
           </tbody>
         </table>
       </div>
-      <p>The output is <code>{"creates":[...], "updates":[...], "deletes":[...]}</code>; every action must carry a <code>reason</code> (“for a CREATE, state which existing observations you considered and why none matched — this is audited to catch duplicate creates”). And <strong>at most one UPDATE per <code>observation_id</code></strong> (several would silently overwrite each other).</p>
+      <p>Output is <code>{"creates":[...], "updates":[...], "deletes":[...]}</code>; every action must carry a <code>reason</code> (“for a CREATE, state which existing observations you considered and why none matched — this is audited to catch duplicate creates”). And <strong>at most one UPDATE per <code>observation_id</code></strong> (multiple would silently overwrite each other).</p>
       <div class="callout why">
-        <p class="callout-title">💡 The model isn't trusted, so there are deterministic guard rails</p>
-        <p>After the LLM there are several deterministic defenses: <code>_dedupe_updates</code> collapses multiple updates to the same <code>observation_id</code>; an <strong>exact-text guard</strong> drops CREATEs whose text verbatim reproduces an observation already shown (because “the model intermittently does exactly this”); and optional <strong>semantic dedup</strong> (when threshold &lt; 1.0) probes each CREATE/UPDATE against its top-5 in-scope neighbors and uses a focused second LLM call to adjudicate merge-vs-keep.</p>
+        <p class="callout-title">💡 The model isn't trusted, so layers of defense</p>
+        <p>After the LLM there are several deterministic guardrails: <code>_dedupe_updates</code> collapses multiple updates to the same <code>observation_id</code>; an <strong>exact-text guard</strong> drops CREATEs that verbatim reproduce an observation already in the context (because “the model intermittently does this”); and optional <strong>semantic dedup</strong> (when the threshold &lt; 1.0) probes each CREATE/UPDATE against its top-5 in-scope neighbors, then a focused second LLM call adjudicates merge-vs-keep on the word-level differences.</p>
       </div>
       <div class="callout concept">
-        <p class="callout-title">📖 Why consolidation uses interleave reranking</p>
-        <p>Consolidation's observation recall uses <code>reranking="interleave"</code> (ch08). The reason is measured and written in the comment: the cross-encoder demotes the near-identical “twin” observation from semantic #1 to reranked #37, and RRF pushes it outside the 512-token budget — so the model never sees it and creates a duplicate. Interleave guarantees each arm's top gets a slot, so the twin is always shown and the model UPDATEs instead of CREATEs.</p>
+        <p class="callout-title">📖 Why consolidation recall uses interleave reranking</p>
+        <p>Consolidation's observation recall uses <code>reranking="interleave"</code> (covered in chapter 08). The reason is measured and written in the comment: the cross-encoder demotes that “near-identical twin observation” from semantic #1 to reranked #37, and RRF also pushes it out of the 512-token budget — so the model never sees it and creates a duplicate. Interleave guarantees each arm's top hits a slot, the twin is always shown, and the model UPDATEs instead of CREATEs.</p>
       </div>
 
       <h2 id="update">5. Update vs recreate, and invalidation</h2>
-      <p><strong>UPDATE mutates in place</strong> — rewrites the observation's text and embedding, extends provenance, merges fields — never recreated from scratch. Two notes: <strong>tags are unioned, not replaced</strong> (so every contributor keeps visibility); temporal fields aggregate (earliest start, latest end, latest mentioned). Each update first snapshots the prior state into the <code>observation_history</code> table, <strong>capped in row count</strong> — because a single JSONB column once grew past PostgreSQL's 256MB jsonb limit on a frequently-reinforced observation and got stuck.</p>
+      <p>An <strong>UPDATE rewrites in place</strong> the observation's text and embedding, extends provenance, merges inherited fields — never re-created from scratch. Two notes: <strong>tags are unioned, not replaced</strong> (every contributor keeps visibility); temporal fields aggregate (earliest start, latest end, latest mentioned). Each update first snapshots the prior state into the <code>observation_history</code> table, <strong>capped in row count</strong> — because an earlier design stored history in a single JSONB column, and an often-reinforced observation grew it past PostgreSQL's 256 MB jsonb limit and got stuck.</p>
       <div class="callout gotcha">
-        <p class="callout-title">⚠️ Invalidation = delete observation + reset consolidated_at</p>
-        <p>When underlying facts are deleted/replaced (document re-ingest, memory delete, tag change, clear observations), <code>delete_stale_observations_for_memories</code> will: ① <strong>delete</strong> observations referencing those facts (even one missing source makes its text stale); ② reset the <strong>surviving</strong> source facts' <code>consolidated_at</code> to NULL so they <strong>re-consolidate next round</strong>. That's the system's re-consolidation mechanism: delete + reset = put the facts back on the work queue. The reverse race (consolidation building from facts deleted mid-run) is closed by <code>_filter_live_source_memories</code>, which re-checks source ids <code>FOR SHARE</code> before every write.</p>
+        <p class="callout-title">⚠️ Invalidation = delete the observation + reset consolidated_at</p>
+        <p>When underlying facts are removed/replaced (document re-ingest, memory delete, tag change, clear observations), <code>delete_stale_observations_for_memories</code> will: ① <strong>delete</strong> the observations referencing those facts (even one missing source makes its text stale); ② reset the <strong>surviving</strong> source facts' <code>consolidated_at</code> to NULL so they <strong>re-consolidate next round</strong>. That's the system's “re-consolidation” mechanism: delete + reset = put the facts back in the work queue. The reverse race (consolidation building an observation from facts deleted mid-run) is closed by <code>_filter_live_source_memories</code>, which re-checks source ids <code>FOR SHARE</code> before every insert/update.</p>
       </div>
 
-      <h2 id="trigger">6. Triggering and scheduling</h2>
+      <h2 id="trigger">6. Triggering & scheduling</h2>
       <ul>
-        <li><strong>Automatic after Retain</strong>: each fact insert calls <code>_submit_post_insert_maintenance</code>, gated by bank config <code>enable_observations</code> + <code>enable_auto_consolidation</code>. Failure is only logged, <strong>never raised</strong> — consolidation must not fail a retain.</li>
-        <li><strong>Bank-level dedupe</strong>: on submit, if an unscoped <code>pending</code> op already exists for the bank, the existing <code>operation_id</code> is reused instead of queueing a duplicate (dedupe checks only <code>pending</code>, not <code>processing</code> — a processing task uses a watermark from when it started, so facts added after that still need a fresh run).</li>
-        <li><strong>Worker claims it</strong>: a separate worker process polls <code>async_operations</code> every 500ms, with <strong>reserved slots for consolidation</strong> (default <code>{"consolidation": 2}</code>), guaranteeing it capacity without starving retains.</li>
+        <li><strong>Automatic after Retain</strong>: after each fact insert, <code>_submit_post_insert_maintenance</code> is called, gated by bank config <code>enable_observations</code> + <code>enable_auto_consolidation</code>. Failure is only logged, <strong>never raised</strong> — consolidation can't fail a retain.</li>
+        <li><strong>Bank-level dedupe</strong>: on submit, if an “unscoped pending” operation already exists for the bank, the original <code>operation_id</code> is reused instead of queuing a duplicate (dedupe checks only <code>pending</code>, not <code>processing</code> — a processing task uses a watermark from when it started, so facts added after that still need a fresh run).</li>
+        <li><strong>Worker claims it</strong>: a separate worker process polls <code>async_operations</code> every 500ms, with <strong>reserved slots for consolidation</strong> (default <code>{"consolidation": 2}</code>) so consolidation gets guaranteed capacity without starving retains.</li>
         <li><strong>Manual / maintenance</strong>: <code>POST /banks/{id}/consolidate</code>, clearing a memory's observations, a maintenance reconcile that sweeps backlog.</li>
-        <li><strong>Self re-queue</strong>: hitting the per-round memory budget re-submits the job — and this failure <strong>must propagate</strong>, else “the bank has backlog and no queued work — silently stuck”.</li>
-        <li><strong>Downstream</strong>: on a completed final round, submit refresh tasks for tag-matching user mental models with <code>refresh_after_consolidation</code>.</li>
+        <li><strong>Self re-queue</strong>: hitting the per-round budget re-submits the job — and that failure <strong>must propagate</strong>, else “the bank has backlog but no queued work — silently stuck”.</li>
+        <li><strong>Downstream</strong>: on a completed final round, consolidation submits <code>refresh_mental_model</code> tasks for stale user-defined mental models with matching tags.</li>
       </ul>
 
-      <h2 id="gotchas">7. Decisions and pitfalls</h2>
+      <h2 id="gotchas">7. Design decisions & gotchas</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Point</th><th>Detail</th></tr></thead>
+          <thead><tr><th>Point</th><th>Notes</th></tr></thead>
           <tbody>
-            <tr><td>tags are a security boundary, not a hint</td><td>different tags never share an LLM call; recall uses <code>all_strict</code>; writes re-validate per-fact recall sets — prevents cross-tenant/cross-user leakage</td></tr>
-            <tr><td>visibility is algorithmic, the model doesn't decide</td><td>tags are inherited/merged by code; the prompt says “do not output tags”</td></tr>
-            <tr><td>only world/experience consolidate</td><td>observations don't consolidate each other; a single-fact failure is stamped and no longer auto-runs (manual recover exists)</td></tr>
-            <tr><td><code>total_count</code> is a point-in-time estimate</td><td>facts retained mid-run get picked up, so <code>processed</code> can exceed it</td></tr>
-            <tr><td>semantic dedup is PG-only</td><td>uses <code>unnest</code>/<code>array_agg</code>/<code>UPDATE...FROM</code>; Oracle skips it and uses an <code>observation_sources</code> junction table</td></tr>
-            <tr><td><code>shared</code> scope is untagged, globally visible</td><td>misuse is a cross-tag leak; it's positioned as the dedup-across-provenance-tags mode</td></tr>
+            <tr><td>Tags are a security boundary, not a hint</td><td>Facts with different tags never share an LLM call; recall uses <code>all_strict</code>; writes re-check the per-fact recall set — preventing cross-tenant/cross-user leakage</td></tr>
+            <tr><td>Visibility is algorithmic, the model doesn't decide</td><td>Tags are inherited/merged by algorithm; the prompt explicitly says “don't output tags”</td></tr>
+            <tr><td>Only world/experience consolidate</td><td>Observations don't consolidate each other; a singleton failure is stamped and excluded from future automatic runs (manual recover exists)</td></tr>
+            <tr><td><code>total_count</code> is a point-in-time estimate</td><td>Facts retained mid-run get picked up; <code>processed</code> may exceed it</td></tr>
+            <tr><td>Semantic dedup is PG-only</td><td>Uses <code>unnest</code>/<code>array_agg</code>/<code>UPDATE...FROM</code>; Oracle skips it and uses the <code>observation_sources</code> junction table</td></tr>
+            <tr><td><code>shared</code> scope is untagged & globally visible</td><td>Misuse is a cross-tag leak; docs frame it as the dedicated dedup-across-provenance-tags mode</td></tr>
           </tbody>
         </table>
       </div>
@@ -185,12 +185,12 @@ for m in memories:
       <div class="summary">
         <h2>Summary</h2>
         <ul>
-          <li>Consolidation = bottom-up learning: facts → observation (a special fact); decoupled from retain (no full set, expensive, re-runnable).</li>
-          <li>The work queue is a SQL predicate; group by exact tag set (security); per batch “parallel recall → one LLM → sequential writes”; delete before create.</li>
-          <li>Policy core: <strong>prefer UPDATE</strong>; no computation; layered defenses against the model; <strong>tags are a security boundary</strong>.</li>
+          <li>Consolidation = bottom-up learning: facts → observation (a special fact); decoupled from retain (no full set, expensive, resumable).</li>
+          <li>The work queue is a SQL predicate; group by exact tag set (security); each batch “parallel recall → one LLM → sequential writes”; delete before create.</li>
+          <li>Policy core: <strong>prefer UPDATE</strong>; no computation; layers of defense against the model erring; <strong>tags are a security boundary</strong>.</li>
           <li>Invalidation = delete observation + reset <code>consolidated_at</code> = re-consolidation.</li>
         </ul>
-        <p>Next, the read-side “reflection”: how Reflect uses a tool-using agent loop to draw on observations and mental models on demand, and produce a disposition-aware answer.</p>
+        <p>Next chapter we look at the read-side “reflection”: how Reflect uses a tool-calling agent loop to draw on observations and mental models on demand and produce a disposition-aware answer.</p>
       </div>
 
     </article>

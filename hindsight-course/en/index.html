@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Course Guide — Hindsight Source Deep-Dive</title>
-  <meta name="description" content="A progressive, engineering-oriented course that reads the implementation, design, and pitfalls of Hindsight — a production-grade agent memory system.">
+  <title>Course Guide — Reading Hindsight's Source</title>
+  <meta name="description" content="A progressive, engineering-oriented course that walks through the implementation, design rationale, and pitfalls of Hindsight — a production-grade agent memory system.">
   <link rel="stylesheet" href="../assets/css/course.css">
   <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
 </head>
@@ -16,55 +16,54 @@
     <article class="landing">
 
       <div class="hero">
-        <p class="eyebrow">Open-source deep-dive · reads offline</p>
-        <h1>Hindsight Source Deep-Dive</h1>
-        <p class="lead">Read a <strong>production-grade agent memory system</strong> the way you'd read an engineering course — step by step, covering the implementation, the design <em>rationale</em>, and the “why is this so complicated?” pitfalls.</p>
+        <p class="eyebrow">Open-source source-code walkthrough · read offline</p>
+        <h1>Reading Hindsight's Source</h1>
+        <p class="lead">Like working through an engineering course, this walks step by step through the implementation details, design rationale, and the “it could be simpler — why isn't it?” gotchas of a <strong>production-grade agent memory system</strong>.</p>
         <div class="badge-row">
-          <span class="badge">English · code kept verbatim</span>
+          <span class="badge">Bilingual · EN / 中文</span>
           <span class="badge">Mermaid diagrams</span>
           <span class="badge">Source cross-references</span>
           <span class="badge">12 chapters + appendix</span>
-          <span class="badge">Light / dark</span>
-          <span class="badge">中文 available</span>
+          <span class="badge">Light / dark theme</span>
         </div>
       </div>
 
       <div class="keypoints">
-        <h3>After this course you should be able to answer</h3>
+        <h3>By the end of this course you should be able to answer</h3>
         <ul>
-          <li>Why “chunk the text and vectorize it” (naive RAG) is not enough for agent memory — and what Hindsight does on top.</li>
-          <li>How a conversation becomes <strong>atomic facts</strong>, extracted <strong>entities</strong>, and three kinds of <strong>edges</strong> (temporal / semantic / causal).</li>
-          <li>How retrieval runs <strong>semantic, BM25, graph, and temporal</strong> paths in parallel, then fuses with RRF and reranks with a cross-encoder.</li>
-          <li>How a system that “learns” <strong>consolidates</strong> scattered facts into observations / mental models — and why that can't happen inline during writes.</li>
-          <li>Why the seemingly over-engineered choices (streaming mini-batches, Phase1/2/3 transactions, delta retains, async idempotency) exist — what failure each one prevents.</li>
+          <li>Why is “chunk the text, then vectorize it” (plain RAG) not enough for agent memory? What does Hindsight do on top?</li>
+          <li>Once a conversation enters the system, how is it split into <strong>atomic facts</strong>, how are <strong>entities</strong> extracted, and how are the <strong>temporal / semantic / causal</strong> edges built?</li>
+          <li>At query time, how do the <strong>semantic, BM25, graph, and temporal</strong> arms run in parallel, and how are they merged with RRF and reranked by a cross-encoder?</li>
+          <li>How does a system that “learns” <strong>consolidate</strong> scattered facts into observations / mental models — and why can't that happen inline at write time?</li>
+          <li>What problem is each piece of seemingly over-engineered design (streaming mini-batches, Phase1/2/3 transactions, delta retains, async idempotency) actually defending against?</li>
         </ul>
       </div>
 
       <h2 id="what">What this course is</h2>
-      <p>The folder you have is a fork of <a href="https://github.com/vectorize-io/hindsight" target="_blank" rel="noopener">Hindsight</a>, an open-source <strong>agent long-term memory system</strong>: it gives an LLM agent the ability to <em>remember, recall, and reflect</em>, so the agent doesn't just “run with the conversation history” but <strong>learns over time</strong>. It reports strong results on long-term-memory benchmarks (LongMemEval) and is used in production.</p>
-      <p>The system is complete, and therefore <strong>large</strong>: several core files are tens of thousands of lines, and the monorepo also holds a Next.js console, a Rust CLI, dozens of framework integrations, and multi-language SDKs. Dropping straight into the source is an easy way to get lost.</p>
-      <p>So this is not a “list of functions.” Each chapter first states <strong>the problem being solved</strong>, then <strong>how it's solved</strong>, then walks you through <strong>the real source logic</strong>, and finally flags <strong>the pitfalls</strong>. Where the system implements one thing several ways (a dozen LLM providers, several document parsers, etc.), we read the most representative one in depth and cover the rest by <strong>comparison</strong>.</p>
+      <p>The folder you have is a fork of <a href="https://github.com/vectorize-io/hindsight" target="_blank" rel="noopener">Hindsight</a>, an open-source <strong>agent long-term memory system</strong>: it gives LLM agents the ability to <em>remember, recall, and reflect</em>, so an agent doesn't just “run with its conversation history” but actually <strong>learns over time</strong>. It reports state-of-the-art results on long-term-memory benchmarks like LongMemEval, and it is used in production.</p>
+      <p>The system is mature, which also means it is <strong>large</strong>: several core-engine files run to tens of thousands of lines, and the monorepo also contains a Next.js console, a Rust CLI, dozens of framework integrations, and multi-language SDKs. Dropping straight into the source is a good way to get lost.</p>
+      <p>So this is not a “list of functions.” It breaks the system into progressive chapters; each one first asks <strong>what problem it solves</strong>, then <strong>how it solves it</strong>, then <strong>walks the key logic against the source</strong>, and finally flags the <strong>pitfalls</strong>. Where the system implements the same thing several ways (a dozen LLM providers, several document parsers, etc.), we read the most representative one in depth and cover the rest <strong>by comparison</strong>.</p>
 
       <div class="callout concept">
-        <p class="callout-title">📖 The narrative through-line</p>
-        <p>In one sentence: <strong>Hindsight does not “store the text then embed it” — it turns text into an atomic fact network that is retrievable, linkable, and consolidatable.</strong> Nearly all the complexity serves that network's three needs: written correctly, found efficiently, and able to keep learning. Keep that line in mind and the rest lines up.</p>
+        <p class="callout-title">📖 The narrative thread</p>
+        <p>In one line: <strong>Hindsight does not “store the raw text and embed it” — it turns text into an atomic fact network that is retrievable, linkable, and consolidable.</strong> Almost all the complexity is in service of making that network “correct to write, efficient to query, and able to learn.” Keep that thread in mind and everything clicks into place.</p>
       </div>
 
       <h2 id="who">Who it's for · prerequisites</h2>
       <div class="card-grid">
-        <div class="card"><h4>✅ You need</h4><p>Basic programming literacy (you can roughly follow Python/SQL), and you've <strong>heard of</strong> “agent”, “LLM”, “vector search / RAG”, “embedding”.</p></div>
-        <div class="card"><h4>🚫 You don't need</h4><p>To have written an agent framework, built RAG, or read any memory-system source — that's exactly what this course supplies. Rust / Next.js details are not required.</p></div>
-        <div class="card"><h4>🎯 Target reader</h4><p>Someone who knows what agent terminology and frameworks look like but <strong>hasn't implemented one</strong>, and wants to see how a serious production implementation actually works.</p></div>
+        <div class="card"><h4>✅ You need</h4><p>Basic programming literacy (you can roughly follow Python/SQL); you've <strong>heard of</strong> and roughly understand “agent”, “LLM”, “vector search / RAG”, “embedding”.</p></div>
+        <div class="card"><h4>🚫 You don't need</h4><p>To have written an agent framework, built RAG, or read any memory system's source — that's exactly what this course fills in. No Rust or Next.js internals required.</p></div>
+        <div class="card"><h4>🎯 The target reader</h4><p>Someone who knows what agent terminology and frameworks <em>look like</em> but has <strong>never implemented one</strong>, and wants to understand how a serious, industrial-grade implementation actually lands.</p></div>
       </div>
 
       <h2 id="hindsight-1min">Hindsight in one minute</h2>
-      <p>Hindsight organizes memory in a biomimetic way, in three layers:</p>
+      <p>Hindsight organizes an agent's memory in a “biomimetic” way, in three tiers:</p>
       <ul>
-        <li><strong>World facts</strong>: objective claims about the world — “the stove gets hot”, “Alice works at Google”.</li>
-        <li><strong>Experience facts</strong>: the agent's own experiences — “I touched the stove and it hurt”.</li>
-        <li><strong>Mental models / observations</strong>: higher-level understanding <strong>reflected and consolidated</strong> out of scattered facts — “the user prefers functional programming”.</li>
+        <li><strong>World facts</strong>: objective statements about the world, e.g. “the stove gets hot”, “Alice works at Google”.</li>
+        <li><strong>Experience facts</strong>: the agent's own experiences, e.g. “I touched the stove and it hurt”.</li>
+        <li><strong>Mental models / observations</strong>: higher-level understanding <strong>reflected and consolidated</strong> out of the scattered facts, e.g. “the user prefers functional programming”.</li>
       </ul>
-      <p>Memories live in isolated <strong>banks</strong> — think “one brain per user/agent”; banks never leak data into each other. A bank can also carry a <strong>disposition</strong> (skepticism, literalism, empathy, each 1–5) that affects only <em>reflection</em>, never retrieval.</p>
+      <p>Memories live in isolated <strong>banks</strong> — think “one brain per user/agent” — with strict no-leakage between banks. Each bank can also carry a <strong>disposition</strong> (skepticism, literalism, empathy, each 1–5); it only affects <em>how reflect reasons</em>, never recall.</p>
       <p>The system exposes exactly three operations:</p>
       <div class="diagram">
         <div class="mermaid">
@@ -75,36 +74,36 @@ flowchart LR
     F["Reflect<br/>reason"]
   end
   T["text / conversation / doc"] --> R
-  R -->|extract facts, entities, edges| DB[("memory bank<br/>facts + entities + links<br/>+ observations")]
+  R -->|extract facts·entities·edges| DB[("memory bank<br/>facts + entities + links<br/>+ observations")]
   Q["query"] --> C
   C -->|4-way parallel retrieval<br/>fusion + rerank| DB
   Q2["question"] --> F
   F -->|agent loop + tools| DB
-  DB -. consolidates .-> DB
+  DB -. consolidate .-> DB
         </div>
-        <div class="diagram-caption">Fig 0-1: all three operations revolve around one memory bank. Retain writes structured memory, Recall retrieves, Reflect reasons; consolidation is the background loop from the bank back to itself.</div>
+        <div class="diagram-caption">Fig 0-1: all three operations revolve around one memory bank. Retain writes structured memory, Recall retrieves, Reflect reasons; consolidation is the background loop that distills facts into observations.</div>
       </div>
       <ul>
-        <li><strong>Retain</strong> hands the input to an LLM that extracts facts, time, entities, and relations, normalizes them, and stores them — the write path.</li>
+        <li><strong>Retain</strong> hands the input to an LLM that extracts facts, time, entities and relations, normalizes them, and stores them — the write path.</li>
         <li><strong>Recall</strong> runs semantic / keyword (BM25) / graph / temporal retrieval in parallel, then fuses, reranks, and trims to a token budget — the read path.</li>
         <li><strong>Reflect</strong> runs a tool-using agent loop that retrieves memories and mental models on demand and produces a grounded, disposition-aware answer.</li>
       </ul>
 
       <h2 id="how-to-use">How to use this site</h2>
-      <p>The left sidebar lists chapters by part; reading <strong>in order</strong> is recommended because later chapters reuse concepts built earlier. The top-right ☰ opens the sidebar on mobile; the bottom of the sidebar switches <strong>light / dark</strong> and <strong>language</strong> (中文 ↔ EN). Everything is vendored, so it works <strong>fully offline</strong>: double-click <code>index.html</code>, or serve the folder with any static server.</p>
-      <p>There are a few fixed callout styles — meet them once:</p>
-      <div class="callout why"><p class="callout-title">💡 Why it's done this way</p><p>The engineering motivation behind a seemingly redundant design. The part this course cares about most.</p></div>
-      <div class="callout concept"><p class="callout-title">📖 Concept</p><p>Clarifies a key term or mental model.</p></div>
-      <div class="callout gotcha"><p class="callout-title">⚠️ Watch out / pitfall</p><p>Invariants, edge cases, easy misreads. Reading these before the source saves detours.</p></div>
-      <div class="callout tip"><p class="callout-title">✅ Tip</p><p>Reading techniques, debugging advice, further reading.</p></div>
-      <div class="callout source"><p class="callout-title">🔍 Source</p><p>Points to a specific file and function so you can jump to it in your IDE.</p></div>
-      <p>Code blocks with a filename header are <strong>source cross-references</strong>; long functions are usually excerpted and located approximately — <strong>line numbers drift, so always locate by “file path + function name”.</strong> The carded figures are <strong>Mermaid diagrams</strong> (architecture, sequence, state machines).</p>
+      <p>The left sidebar is the table of contents, organized as “part → chapter”; reading <strong>in order</strong> is recommended because later chapters keep referring back to concepts built earlier. The toggle at the bottom of the sidebar switches <strong>light / dark</strong>; the button next to it switches <strong>English / 中文</strong>. Everything is bundled, so the site is fully <strong>offline</strong>: double-click <code>index.html</code>, or serve the folder with any static server.</p>
+      <p>The body uses a few fixed callout styles — meet them once:</p>
+      <div class="callout why"><p class="callout-title">💡 Why this design</p><p>The engineering motivation behind a seemingly redundant choice. The part this course cares about most.</p></div>
+      <div class="callout concept"><p class="callout-title">📖 Concept</p><p>Clarifying a key term or mental model.</p></div>
+      <div class="callout gotcha"><p class="callout-title">⚠️ Watch out / pitfall</p><p>Invariants, edge cases, easy-to-misread bits. Read these before the source to save detours.</p></div>
+      <div class="callout tip"><p class="callout-title">✅ Tip</p><p>Reading techniques, debugging hints, further reading.</p></div>
+      <div class="callout source"><p class="callout-title">🔍 Source</p><p>Points at a concrete file and function so you can jump to it in your IDE.</p></div>
+      <p>Code blocks with a filename header are <strong>source cross-references</strong>; long functions are usually excerpted to the core logic and tagged with an approximate location — <strong>line numbers drift across versions, so always locate by “file path + function name”.</strong> The cards with figures are <strong>Mermaid diagrams</strong> (architecture, sequence, state machines).</p>
 
       <div class="callout tip">
-        <p class="callout-title">✅ Three reading paths</p>
-        <p><strong>① Full course (recommended)</strong>: chapters 01 → 12 in order.<br>
-        <strong>② Fast mental model</strong>: just <a href="ch01-big-picture.html">01 big picture</a> → <a href="ch02-data-model.html">02 data model</a> → <a href="ch03-retain-e2e.html">03 Retain e2e</a> → <a href="ch06-recall-overview.html">06 Recall overview</a> — a few hours for the overall shape.<br>
-        <strong>③ Look something up</strong>: jump to the chapter on the mechanism you care about, then use the <a href="appendix.html">appendix source map</a> to land in the code.</p>
+        <p class="callout-title">✅ Three suggested reading paths</p>
+        <p><strong>① The full course (recommended)</strong>: read chapter 01 straight through to 12.<br>
+        <strong>② A fast mental picture</strong>: just <a href="ch01-big-picture.html">01 Big picture</a> → <a href="ch02-data-model.html">02 Data model</a> → <a href="ch03-retain-e2e.html">03 Retain end-to-end</a> → <a href="ch06-recall-overview.html">06 Recall overview</a> — a few hours for the whole shape.<br>
+        <strong>③ Look things up by question</strong>: want to understand one mechanism (e.g. “how does reranking work?”, “how are entities deduped?”)? Jump to the chapter, then use the <a href="appendix.html">appendix code map</a> to land in the source.</p>
       </div>
 
       <h2 id="run">Run the system (strongly recommended)</h2>
@@ -138,32 +137,31 @@ client.recall(bank_id="my-bank", query="What does Alice do?")
 # Reflect: produce a grounded, disposition-aware answer
 client.reflect(bank_id="my-bank", query="Tell me about Alice")</code></pre>
       </div>
-      <p>Want to single-step the source? The repo has local dev scripts under <code>scripts/dev/</code>: <code>./scripts/dev/start.sh</code> starts the API and the Next.js console together; <code>./scripts/dev/start-api.sh</code> starts just the API (it reads <code>.env</code> automatically). Copy <code>.env.example</code> to <code>.env</code> and fill in your LLM provider and key. Most tests use MockLLM and run offline:</p>
+      <p>Want to single-step through the source? The repo has local dev scripts under <code>scripts/dev/</code>: <code>./scripts/dev/start.sh</code> starts the API and the Next.js console together; <code>./scripts/dev/start-api.sh</code> starts only the API (it reads <code>.env</code> automatically). Copy <code>.env.example</code> to <code>.env</code> and fill in your LLM provider and key. Most tests use a MockLLM and run offline:</p>
       <div class="code-block">
         <div class="code-header"><span>shell</span><span class="lang">bash</span></div>
         <pre><code class="language-bash">cd hindsight-api-slim && uv run pytest tests/ -n auto   # all tests, parallel
 cd hindsight-api-slim && uv run pytest tests/test_retain.py::test_retain_simple -v  # one test</code></pre>
       </div>
       <div class="callout tip">
-        <p class="callout-title">✅ You can read with no LLM key at all</p>
-        <p>Set <code>HINDSIGHT_API_LLM_PROVIDER</code> to <code>none</code> and the system forces the “whole chunk is one memory unit, no LLM extraction” degraded path (covered in ch11). The tests use the built-in <code>MockLLM</code> — fully deterministic, no cost. So <strong>reading the code itself needs no key</strong>.</p>
+        <p class="callout-title">✅ No LLM key? You can still read</p>
+        <p>Set <code>HINDSIGHT_API_LLM_PROVIDER</code> to <code>none</code> and the system forces a degraded “whole-chunk-as-a-memory-unit, no LLM extraction” path (covered in chapter 11). Tests use the built-in <code>MockLLM</code> — fully deterministic, no cost. So <strong>reading the code itself never needs a key</strong>.</p>
       </div>
 
       <h2 id="syllabus">Syllabus</h2>
-      <p>The table of contents below is generated by the site; click to jump:</p>
+      <p>The outline below is generated by the site; click to jump:</p>
       <div id="toc"></div>
 
       <h2 id="about">On accuracy</h2>
-      <p>This site is written from an <strong>actual reading of this fork's source</strong>; key claims carry source cross-references wherever possible, and anything inferred rather than stated in code is flagged in the text. Two notes:</p>
+      <p>This site is written from actually reading <strong>this fork's current source</strong>; key claims carry source cross-references wherever possible, and anything inferred rather than stated in the code is marked as such. Two caveats:</p>
       <ul>
-        <li><strong>Line numbers drift.</strong> Always locate by “file path + function name”; code snippets are excerpted and abbreviated for readability.</li>
-        <li><code>CLAUDE.md</code> / <code>AGENTS.md</code> at the repo root are the original authors' <strong>development conventions</strong>, not the source of this course; this site takes an independent, teaching-oriented angle. The <code>frame/</code> directory is an earlier, brief Retain-only guide that this site greatly expands.</li>
-        <li>This English edition mirrors the Chinese edition (<code>中文</code> in the sidebar). Both are generated from one shared structure, so adding another language is additive — a point the project structure is designed to make cheap.</li>
+        <li><strong>Line numbers drift.</strong> Always locate by “file path + function name”; code snippets are excerpted and abbreviated for explanation.</li>
+        <li>The repo's root <code>CLAUDE.md</code> / <code>AGENTS.md</code> are the original authors' <strong>development-spec</strong> documents, not the source of this course; this site has its own, independent perspective.</li>
       </ul>
 
       <div class="footer-note">
-        Hindsight Source Deep-Dive · local static site · Mermaid and highlight.js vendored, offline-ready · made with care and a lot of <code>grep</code>.
-        Let's begin: <a href="ch01-big-picture.html">Chapter 01 · Big Picture &amp; Core Concepts →</a>
+        Reading Hindsight's Source · local static site · Mermaid and highlight.js bundled, works offline · made with care and a lot of <code>grep</code>.
+        Let's begin: <a href="ch01-big-picture.html">Chapter 01 · The Big Picture &amp; Core Concepts →</a>
       </div>
 
     </article>

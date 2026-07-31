@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>11 · The LLM Abstraction &amp; Embeddings — Hindsight Source Deep-Dive</title>
+  <title>11 · The LLM Abstraction & Embeddings — Reading Hindsight's Source</title>
   <link rel="stylesheet" href="../assets/css/course.css">
   <link rel="stylesheet" href="../assets/css/hljs-github.css" id="hljs-theme">
 </head>
@@ -15,18 +15,18 @@
     <article class="chapter">
 
       <p class="eyebrow">Part 5 · Cross-Cutting Infrastructure</p>
-      <h1>11 · The LLM Abstraction &amp; Embeddings</h1>
-      <p class="lead">Every operation stands on the same foundation: calling an LLM (extract facts, consolidate, reflect) and generating embeddings (semantic retrieval). This chapter covers that cross-cutting abstraction — how a dozen providers collapse into <strong>one interface</strong>, how structured output is guaranteed, how embedding dimensions are managed, and a <strong>hierarchical-config truth that CLAUDE.md can mislead you on</strong>.</p>
+      <h1>11 · The LLM Abstraction Layer & Embeddings</h1>
+      <p class="lead">Every operation earlier stood on the same foundation: calling an LLM (fact extraction, consolidation, reflect) and generating embeddings (semantic retrieval). This chapter covers that cross-cutting abstraction — how a dozen providers collapse into <strong>one interface</strong>, how structured output is guaranteed, how embedding dimensions are managed, and a hierarchical-config truth that <strong>CLAUDE.md can mislead you about</strong>.</p>
 
       <div class="keypoints">
         <h3>Chapter takeaways</h3>
         <ul>
-          <li>Three layers: <code>LLMProvider</code> (facade) wraps an <code>LLMInterface</code> implementation the factory selects; the engine talks only to the facade (which adds concurrency permits, retry policy, tracing, multi-LLM routing). Embeddings are a separate, simpler hierarchy, one server-wide instance.</li>
-          <li>The interface has <strong>no streaming</strong> — Hindsight is a batch memory system, not a chat UI; every call awaits completion.</li>
-          <li>Provider selection is an <code>if/elif</code> factory; a large set (openai/groq/ollama/lmstudio/minimax…) all land on the same <code>OpenAICompatibleLLM</code>.</li>
-          <li>Structured output is a three-tier ladder: <strong>strict (grammar-enforced)</strong> → soft (prompt + json_object) → no grammar (some local backends).</li>
-          <li>Embedding dimension is <strong>owned by the model</strong>; the schema follows the model, a model switch recomputes the dimension (#2209).</li>
-          <li><strong>provider/model/key are NOT per-bank configurable</strong> — they're server-level + per-operation; CLAUDE.md's “LLM settings are hierarchical” does not hold at the bank level.</li>
+          <li>Three layers: <code>LLMProvider</code> (facade) wraps an <code>LLMInterface</code> implementation chosen by a factory; the engine only talks to the facade (which adds concurrency permits, retry policy, tracing, multi-LLM routing). Embeddings are a separate, simpler hierarchy, one server-wide instance.</li>
+          <li>The interface <strong>has no streaming</strong> — Hindsight is a batch memory system, not a chat UI; every call is awaited to completion.</li>
+          <li>Provider selection is one <code>if/elif</code> factory; a large group (openai/groq/ollama/lmstudio/minimax…) all land on the same <code>OpenAICompatibleLLM</code>.</li>
+          <li>Structured output in three tiers: <strong>strict (grammar-enforced)</strong> → soft (prompt + json_object) → no grammar (some local backends).</li>
+          <li>The embedding dimension is <strong>owned by the model</strong>; the schema follows the model, and a model switch re-dimensions (#2209).</li>
+          <li><strong>Provider/model/key are not per-bank overridable</strong> — they're server-level + per-operation; CLAUDE.md's “LLM settings are hierarchical” does not hold at the bank level.</li>
         </ul>
       </div>
 
@@ -37,10 +37,10 @@ flowchart LR
   ENG["engine<br/>(retain/recall/reflect/consolidation)"] --> FAC["LLMProvider facade<br/>llm_wrapper.py"]
   FAC -->|concurrency permits · retry policy · tracing| IMPL["LLMInterface impl<br/>providers/*"]
   FAC -.->|multi-LLM chain| MULTI["MultiLLMProvider<br/>failover / weighted round-robin"]
-  IMPL --> OPENAI["OpenAICompatibleLLM (many)"]
-  IMPL --> OTHER["Anthropic/Gemini/LiteLLM/Mock/None..."]
+  IMPL --> OPENAI["OpenAICompatibleLLM (a large group)"]
+  IMPL --> OTHER["Anthropic/Gemini/LiteLLM/Mock/None ..."]
         </div>
-        <div class="diagram-caption">Fig 11-1: the engine only knows the facade; the facade handles cross-cutting concerns and delegates to a concrete provider. The multi-LLM chain provides failover / load balancing.</div>
+        <div class="diagram-caption">Fig 11-1: the engine only knows the facade; the facade handles cross-cutting concerns and delegates the call to a concrete provider. The multi-LLM chain provides failover / load balancing.</div>
       </div>
 
       <h2 id="iface">2. The LLM interface: the contract</h2>
@@ -52,38 +52,38 @@ flowchart LR
                initial_backoff=1.0, max_backoff=60.0, skip_validation=False,
                strict_schema=False, return_usage=False, cached_prefix=None) -&gt; Any:
     # response_format: a Pydantic model for structured output
-    # scope: a scope id for tracing
-    # strict_schema: grammar-enforce via json_schema strict (rather than soft json_object)
+    # scope: a scope identifier for tracking
+    # strict_schema: grammar-enforce via json_schema strict (vs soft json_object)
     # return_usage: if True, return (result, TokenUsage)
     # cached_prefix: an opaque handle for a cacheable system prefix (Gemini etc.)</code></pre>
       </div>
       <ul>
-        <li><strong>No streaming</strong>: grepping <code>stream</code> in the LLM layer is empty. Every call waits to completion — fitting a “memory system”, not a “chat UI”.</li>
-        <li><strong>Capability hooks default to no-ops</strong>: <code>supports_batch_api()</code>, <code>supports_prompt_caching()</code> + <code>get_or_create_cached_prefix()</code>, etc.; providers that don't support them “transparently run uncached”. The division of labor is explicit: <strong>“the engine decides WHAT is cacheable; the provider only chooses HOW to cache”</strong> (Gemini explicit CachedContent / OpenAI automatic / Anthropic inline markers).</li>
-        <li>Tool calls return <code>LLMToolCallResult</code>, using a typed <code>LLMToolChoice</code> (AUTO/NONE/REQUIRED/NAMED) — “serialized only at provider boundaries”, so a provider's native tool-choice dialect never leaks into engine code.</li>
+        <li><strong>No streaming</strong>: grep <code>stream</code> in the LLM layer is empty. Every call is awaited to completion — fitting a “memory system” rather than a “chat UI”.</li>
+        <li><strong>Capability hooks default to no-ops</strong>: <code>supports_batch_api()</code>, <code>supports_prompt_caching()</code> + <code>get_or_create_cached_prefix()</code>, etc.; a provider that doesn't support them just “transparently runs uncached”. The division of labor is written plainly: <strong>“the engine decides WHAT is cacheable; a provider only chooses HOW to cache that prefix”</strong> (explicit Gemini CachedContent / OpenAI automatic / Anthropic inline markers).</li>
+        <li>Tool calls return an <code>LLMToolCallResult</code>, using a typed <code>LLMToolChoice</code> (AUTO/NONE/REQUIRED/NAMED) — “serialized only at provider boundaries”, so a provider's native tool-choice dialect never leaks into engine code.</li>
       </ul>
 
       <h2 id="facade">3. The LLMProvider facade: cross-cutting concerns</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>engine/llm_wrapper.py</code> → <code>LLMProvider</code>.</p>
       <div class="callout why">
         <p class="callout-title">💡 The constructor deliberately “reads no global config”</p>
-        <p><code>LLMProvider</code>'s constructor takes ~20 arguments and <strong>deliberately does not read the global <code>HindsightConfig</code></strong>. Why? So “a provider's effective config is a pure function of its arguments” — and that is exactly the precondition for letting <strong>each member of a multi-LLM chain be configured independently</strong>. Default resolution is left to the caller.</p>
+        <p><code>LLMProvider</code>'s constructor takes ~20 arguments and <strong>deliberately does not read the global <code>HindsightConfig</code></strong>. Why? So that “a provider's effective settings are a pure function of its arguments” — which is exactly the prerequisite for <strong>each member of a multi-LLM chain to be configured independently</strong>. Resolving defaults is left to the caller.</p>
       </div>
-      <p><code>LLMProvider.call</code> does the cross-cutting work, then delegates:</p>
+      <p><code>LLMProvider.call</code> does the cross-cutting work then delegates:</p>
       <ol>
-        <li><strong>Retry-policy resolution</strong>: this call's arg → provider-configured default → method fallback (10/1.0/60.0).</li>
-        <li><strong><code>strict_schema</code> resolved once</strong>: <code>x if x is not None else get_config().llm_strict_schema</code>. The comment warns you <strong>can't use <code>or</code></strong> — that would make “explicitly passed False this call” indistinguishable from “unset”.</li>
-        <li><strong>Concurrency permits</strong>: enter all semaphores for that scope (per-operation + global), tagging a <code>.queued</code> stage first. The comment cites incident #3002: someone once spent an hour debugging <code>llm.bedrock.*</code> for tasks that had never reached Bedrock — they were stuck in the queue.</li>
-        <li><strong>Delegate</strong> to <code>_provider_impl.call(...)</code>; on exception, attach the provider-reported usage to the error trace (the provider charged regardless of success).</li>
+        <li><strong>Retry-policy resolution</strong>: per-call arg → provider-configured default → method fallback (10/1.0/60.0).</li>
+        <li><strong><code>strict_schema</code> resolved once</strong>: <code>x if x is not None else get_config().llm_strict_schema</code>. The comment warns: <strong>you can't use <code>or</code></strong> — that would make “explicitly passed False this call” indistinguishable from “unset”.</li>
+        <li><strong>Concurrency permits</strong>: enter every semaphore for that scope (per-operation + global), first tagging a <code>.queued</code> stage. The comment cites incident #3002: someone once spent an hour debugging <code>llm.bedrock.*</code> for tasks that had never even reached Bedrock — they were stuck in the queue.</li>
+        <li><strong>Delegate</strong> to <code>_provider_impl.call(...)</code>; on exception, attach the provider's already-reported usage to the error trace (the provider charged whether or not it succeeded).</li>
       </ol>
       <h3 id="usage">Token accounting: two paths</h3>
       <ul>
-        <li><strong>Return path</strong>: <code>return_usage=True</code> returns <code>(result, TokenUsage)</code>; <code>TokenUsage</code> has <code>input/output/total/cached/thoughts_tokens</code> and <code>__add__</code> for aggregation.</li>
-        <li><strong>Side-channel</strong>: providers stash usage into a contextvar <strong>before local parsing</strong> (<code>stash_response_usage</code>). Why? issue #2387 — the provider call may have <strong>succeeded and been billed</strong>, but the subsequent JSON parse/validation fails; then the real token count must be attached to the error trace (the money is spent either way).</li>
+        <li><strong>Return path</strong>: <code>return_usage=True</code> returns <code>(result, TokenUsage)</code>; <code>TokenUsage</code> has <code>input/output/total/cached/thoughts_tokens</code> and an <code>__add__</code> for aggregation.</li>
+        <li><strong>Side channel</strong>: providers stash usage into a contextvar <strong>before local parsing</strong> (<code>stash_response_usage</code>). Why? issue #2387 — the provider call may have <strong>succeeded and been billed</strong>, but the subsequent JSON parse/validation fails; then the real token count must be attached to the error trace (the money's spent regardless).</li>
       </ul>
-      <p>The retry loop lives <strong>inside each provider</strong>, exponential backoff; classification is careful: 401/403 <strong>fast-fail, no retry</strong> (auth errors won't improve); <code>OutputTooLongError</code> not retried; <code>MultiLLMProvider</code> adds a tier — each member exhausts its own retries, then the router advances (failover or weighted round-robin), but <strong>over-length output never fails over</strong> (“a different provider won't fit it either”).</p>
+      <p>The retry loop lives <strong>inside each provider</strong>, exponential backoff; classification is careful: 401/403 <strong>fast-fail, no retry</strong> (retrying an auth error is pointless); <code>OutputTooLongError</code> not retried; <code>MultiLLMProvider</code> adds another tier — each member exhausts its own retries, then the router advances (failover or weighted round-robin), but <strong>over-length output does not fail over</strong> (“a different provider won't fit it either”).</p>
 
-      <h2 id="factory">4. Provider model: an if/elif factory</h2>
+      <h2 id="factory">4. The provider model: one if/elif factory</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>llm_wrapper.py</code> → <code>create_llm_provider</code> (~lines 270–539). <strong>No</strong> decorator registry — just an <code>if/elif</code> on the lowercased provider string.</p>
       <div class="table-wrap">
         <table>
@@ -98,41 +98,41 @@ flowchart LR
           </tbody>
         </table>
       </div>
-      <p><code>OpenAICompatibleLLM</code> (~1700 lines) is the workhorse: it builds one <code>call_params</code> dict + per-vendor fixups (Groq seed/service_tier; MiniMax temperature clamped to <code>[0.01,1]</code>; reasoning models get <code>reasoning_effort</code> and a 16k-token floor) and absorbs a large set of OpenAI-compatible backends. <strong>Per-operation provider selection</strong> happens in <code>MemoryEngine.__init__</code>, as three independent fallback chains: <code>retain/reflect/consolidation_llm_provider or config.* or memory_llm_provider</code>.</p>
+      <p><code>OpenAICompatibleLLM</code> (~1700 lines) is the workhorse: one <code>call_params</code> dict + small per-vendor fixups (Groq's seed/service_tier; MiniMax temperature clamped to <code>[0.01,1]</code>; reasoning models get <code>reasoning_effort</code> and a 16k token floor) absorbs a large set of OpenAI-compatible backends. <strong>Per-operation provider selection</strong> happens in <code>MemoryEngine.__init__</code>, as three independent fallback chains: <code>retain/reflect/consolidation_llm_provider or config.* or memory_llm_provider</code>.</p>
       <div class="callout gotcha">
         <p class="callout-title">⚠️ LLMConfig is not a config object</p>
-        <p><code>LLMConfig = LLMProvider</code> (just an alias). Reading <code>memory_engine._build_llm</code> while assuming <code>LLMConfig</code> is a plain config is a quick way to get confused — it's actually the provider facade.</p>
+        <p><code>LLMConfig = LLMProvider</code> (just an alias). Reading <code>memory_engine._build_llm</code> while assuming <code>LLMConfig</code> is a pure config will confuse you — it's actually that provider facade.</p>
       </div>
 
       <h2 id="structured">5. Structured output: a three-tier ladder</h2>
-      <p class="src-ref"><strong>Locate</strong>: <code>providers/openai_compatible_llm.py</code>'s <code>call</code> (prepared once <strong>before</strong> the retry loop); schema handling in <code>structured_output.py</code>.</p>
+      <p class="src-ref"><strong>Locate</strong>: <code>providers/openai_compatible_llm.py</code>'s <code>call</code> (prepared <strong>once before the retry loop</strong>); schema handling in <code>structured_output.py</code>.</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Tier</th><th>Mechanism</th><th>When</th></tr></thead>
           <tbody>
-            <tr><td><strong>strict</strong></td><td><code>response_format={"type":"json_schema","strict":True,...}</code>, grammar-enforced. The schema is normalized by a custom <code>OpenAIStrictSchemaGenerator</code> into OpenAI's strict subset (all fields required, <code>additionalProperties:False</code>)</td><td><code>strict_schema=True</code> (server flag)</td></tr>
-            <tr><td><strong>soft</strong> (default)</td><td>schema text injected into the system message + <code>{"type":"json_object"}</code>; also ensures the user message contains the word “json” (some gateways require it)</td><td>normal</td></tr>
-            <tr><td><strong>no grammar</strong></td><td>only put the schema in the prompt</td><td><code>lmstudio</code>/<code>ollama</code>/<code>volcano</code> (Ollama also has a native-API path)</td></tr>
+            <tr><td><strong>strict</strong></td><td><code>response_format={"type":"json_schema","strict":True,...}</code>, grammar-enforced. The schema is regularized by a custom <code>OpenAIStrictSchemaGenerator</code> into OpenAI's strict subset (all fields required, <code>additionalProperties:False</code>)</td><td><code>strict_schema=True</code> (server flag)</td></tr>
+            <tr><td><strong>soft</strong> (default)</td><td>schema text injected into the system + <code>{"type":"json_object"}</code>; also ensures the word “json” appears in a user message (some gateways require it)</td><td>normal</td></tr>
+            <tr><td><strong>no grammar</strong></td><td>only the schema in the prompt</td><td><code>lmstudio</code>/<code>ollama</code>/<code>volcano</code> (Ollama also has a separate native-API path)</td></tr>
           </tbody>
         </table>
       </div>
-      <p>The response side is layered with defenses: strip <code>&lt;think&gt;</code> reasoning tags, strip markdown code fences (confirmed for MiniMax, some Ollama models, Claude via proxies), <code>json.loads</code> with a raw-content fallback, retry on parse failure, finally <code>response_format.model_validate(...)</code> (or <code>skip_validation=True</code> returns the raw dict — fact extraction uses this).</p>
+      <p>The response side is defensively layered: strip <code>&lt;think&gt;</code> reasoning tags, strip markdown code fences (confirmed for MiniMax, some Ollama models, Claude via proxies), <code>json.loads</code> with a raw-content fallback, retry on parse failure, finally <code>response_format.model_validate(...)</code> (or <code>skip_validation=True</code> returns the raw dict — fact extraction uses that).</p>
 
-      <h2 id="embed">6. Embeddings: a simpler, separate hierarchy</h2>
+      <h2 id="embed">6. Embeddings: another, simpler hierarchy</h2>
       <p class="src-ref"><strong>Locate</strong>: <code>engine/embeddings.py</code>.</p>
-      <p>The <code>Embeddings</code> ABC has only four things: <code>provider_name</code>, <code>dimension</code> (int property), <code>initialize()</code>, <code>encode(texts)</code>. Implementations include local (sentence-transformers), ONNX, TEI, OpenAI, Cohere, Gemini, etc. The engine holds <strong>one server-wide instance</strong>.</p>
+      <p>The <code>Embeddings</code> ABC has just four members: <code>provider_name</code>, <code>dimension</code> (int property), <code>initialize()</code>, <code>encode(texts)</code>. Implementations include local (sentence-transformers), ONNX, TEI, OpenAI, Cohere, Gemini, etc. The engine holds <strong>one server-wide instance</strong>.</p>
       <div class="callout why">
         <p class="callout-title">💡 The dimension is owned by the model; the schema follows</p>
-        <p>The dimension is <strong>probed</strong> at init (local reads the model's <code>get_sentence_embedding_dimension()</code>; TEI embeds a literal <code>"test"</code> and measures the length), and at startup the live dimension is passed into migrations so the pgvector column matches. A model switch <strong>re-dimensions memory_units</strong>, designed to be “structurally unable to trip a dimension mismatch” (#2209). The archive table simply has no embedding column, so an “archive vector” can't fall out of sync.</p>
+        <p>The dimension is <strong>probed</strong> at init (local reads the model's <code>get_sentence_embedding_dimension()</code> directly; TEI embeds a literal <code>"test"</code> and measures the length), and at startup the live dimension is passed into migrations so the pgvector column matches. A model switch <strong>re-dimensions memory_units</strong>, designed to be “structurally unable to trip a vector-dimension mismatch” (#2209). The archive table has no embedding column at all, so the “archive vector” can't fall out of sync with the live model.</p>
       </div>
-      <p>Two local-vs-TEI details: local <strong>doesn't use MPS by default</strong> (MPS leaks memory under variable-length workloads); the CPU <code>encode</code> <strong>deliberately skips</strong> gc/malloc_trim (it runs in retain's tight loop, where gc every call is too costly). TEI is an httpx client, <code>batch_size=32</code>, exponential backoff only on connect errors/timeouts/5xx. <strong>There is no embedding-level cache</strong> — only batching and GPU-memory reclamation.</p>
+      <p>Two local-vs-TEI details: local by default <strong>doesn't use MPS</strong> (MPS leaks memory under variable-length workloads); the CPU <code>encode</code> <strong>deliberately skips</strong> gc/malloc_trim (it runs in tight retain loops, so a gc every call is too costly). TEI is an httpx client, <code>batch_size=32</code>, retrying only connect errors/timeouts/5xx with exponential backoff. <strong>There is no embedding-level cache</strong> — only batching and GPU memory reclamation.</p>
 
       <h2 id="config">7. Hierarchical config: an important clarification</h2>
-      <p class="src-ref"><strong>Locate</strong>: <code>config_resolver.py</code> → <code>ConfigResolver</code> (<code>get_bank_config</code> for the API, <code>resolve_full_config</code> internally, keeping credentials).</p>
-      <p>Resolution order: <strong>① global (env) → ② tenant overrides → ③ bank overrides</strong>. Resolved on every call (not cached), for consistency across multiple API servers. But here's the key:</p>
+      <p class="src-ref"><strong>Locate</strong>: <code>config_resolver.py</code> → <code>ConfigResolver</code> (<code>get_bank_config</code> for the public API, <code>resolve_full_config</code> internal keeping credentials).</p>
+      <p>Resolution order: <strong>① global (env) → ② tenant overrides → ③ bank overrides</strong>. Resolved on every call (not cached), for consistency across multiple API servers. But the key point is here:</p>
       <div class="callout gotcha">
         <p class="callout-title">⚠️ “LLM settings are hierarchical” is a misunderstanding at the bank level</p>
-        <p>Tenant and bank overrides are both filtered to the <code>_CONFIGURABLE_FIELDS</code> allow-list. And the <strong>LLM provider/model/key fields are <em>not</em> in that set</strong> (they live in <code>_CREDENTIAL_FIELDS</code>); the allow-list holds only behavioral fields (<code>retain_chunk_size</code>, <code>retain_extraction_mode</code>, mission, disposition, recall budgets, etc.). So although CLAUDE.md short-hands it as “LLM settings are hierarchical”, in reality <strong>provider/model selection is server-level and per-operation only</strong> (the three static retain/reflect/consolidation fallback chains), <strong>never per-bank</strong>. The resolver even re-pins the multi-LLM chain objects from global config, “never tenant/bank-overridable”.</p>
+        <p>Both tenant and bank overrides are filtered to the <code>_CONFIGURABLE_FIELDS</code> allowlist. And the <strong>LLM provider/model/key fields are <em>not</em> in that set</strong> (they're in <code>_CREDENTIAL_FIELDS</code>); the allowlist holds only behavioral fields (<code>retain_chunk_size</code>, <code>retain_extraction_mode</code>, mission, disposition, recall budgets, etc.). So although CLAUDE.md shorthand says “LLM settings are hierarchical”, in reality <strong>provider/model selection is server-level and per-operation only</strong> (the three static retain/reflect/consolidation fallback chains), <strong>never per-bank</strong>. The resolver even re-pins multi-LLM chain objects from the global config as “never tenant/bank-overridable”.</p>
       </div>
 
       <h2 id="none-mock">8. none and mock: two special providers</h2>
@@ -140,24 +140,24 @@ flowchart LR
         <table>
           <thead><tr><th></th><th>Behavior</th><th>Use</th></tr></thead>
           <tbody>
-            <tr><td><code>NoneLLM</code></td><td>a safety net: any call raises <code>LLMNotAvailableError</code>. The real degradation is in config validation: <code>llm_provider="none"</code> → force <code>retain_extraction_mode="chunks"</code>, disable observations, reflect returns 400</td><td>the “runs with no LLM” degraded mode</td></tr>
-            <tr><td><code>MockLLM</code></td><td>deterministic: records each call, returns canned answers <strong>by scope</strong> (retain returns canned facts so retain→recall→reflect runs end-to-end; dedup adjudication fixed to <code>keep</code>); can inject exceptions / fake usage</td><td>offline tests</td></tr>
+            <tr><td><code>NoneLLM</code></td><td>Safety net: any call raises <code>LLMNotAvailableError</code>. The real degradation is in config validation: <code>llm_provider="none"</code> → force <code>retain_extraction_mode="chunks"</code>, disable observations, reflect returns 400</td><td>A runnable “no LLM” degraded mode</td></tr>
+            <tr><td><code>MockLLM</code></td><td>Deterministic: records every call, returns canned answers <strong>keyed by scope</strong> (retain returns canned facts so the retain→recall→reflect pipeline runs end-to-end; dedup adjudication fixed to <code>keep</code>); can also inject exceptions / fake usage</td><td>Offline tests</td></tr>
           </tbody>
         </table>
       </div>
 
-      <h2 id="gotchas">9. Decisions and pitfalls</h2>
+      <h2 id="gotchas">9. Design decisions & gotchas</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Point</th><th>Detail</th></tr></thead>
+          <thead><tr><th>Point</th><th>Notes</th></tr></thead>
           <tbody>
-            <tr><td>facade + pure-function constructor</td><td>a provider's effective config is a pure function of its args, so multi-LLM members can each be independent</td></tr>
-            <tr><td>engine decides “what”, provider decides “how”</td><td>caching strategies unified behind one optional hook</td></tr>
-            <tr><td>fail-fast taxonomy</td><td>auth errors never retry; over-length output never retries and never fails over</td></tr>
-            <tr><td>cost honesty</td><td>usage stashed before validation; reasoning tokens subtracted from output counts to avoid double-counting</td></tr>
-            <tr><td>duplicate <code>OutputTooLongError</code></td><td>defined in both <code>llm_interface.py</code> and <code>llm_wrapper.py</code> (same name, different identity); <code>except</code>-ing the wrong import silently misses</td></tr>
-            <tr><td>embedding dimension mismatch is non-retryable</td><td>deterministic; retrying only burns worker slots; needs a fresh request or a fixed backend</td></tr>
-            <tr><td>small models loop on strict structured output</td><td>the facade publishes <code>attempt={n}/{N}</code> to the worker stage specifically to make this observable</td></tr>
+            <tr><td>Facade + pure-function constructor</td><td>A provider's effective config = a pure function of its args, so multi-LLM chain members can each be independent</td></tr>
+            <tr><td>Engine decides “what”, provider decides “how”</td><td>Cache strategies unified behind one optional hook</td></tr>
+            <tr><td>Fail-fast taxonomy</td><td>Auth errors never retry; over-length output never retries and never fails over</td></tr>
+            <tr><td>Cost honesty</td><td>Usage stashed before validation; reasoning tokens subtracted from output counts to avoid double-counting</td></tr>
+            <tr><td>Duplicate <code>OutputTooLongError</code></td><td>Defined in both <code>llm_interface.py</code> and <code>llm_wrapper.py</code> (same name, different identity); <code>except</code> against the wrong import silently misses</td></tr>
+            <tr><td>Embedding dimension mismatch not retryable</td><td>Deterministic error; retrying only burns worker slots; needs a fresh request or a fixed backend</td></tr>
+            <tr><td>Small models loop on strict structured output</td><td>The facade publishes <code>attempt={n}/{N}</code> into the worker stage specifically to observe this</td></tr>
           </tbody>
         </table>
       </div>
@@ -165,12 +165,12 @@ flowchart LR
       <div class="summary">
         <h2>Summary</h2>
         <ul>
-          <li>LLM three layers: interface <code>LLMInterface</code> → facade <code>LLMProvider</code> (cross-cutting) → concrete provider (factory <code>if/elif</code>); no streaming; structured output a three-tier ladder.</li>
-          <li>A large provider set converges on <code>OpenAICompatibleLLM</code>; per-operation provider selection (three fallback chains); <code>LLMConfig</code> is just <code>LLMProvider</code>.</li>
-          <li>Embedding dimension model-owned, schema follows, model switch recomputes; no cache.</li>
-          <li><strong>provider/model/key are not per-bank configurable</strong> (the allow-list holds only behavioral fields) — don't be misled by CLAUDE.md. <code>none</code>/<code>mock</code> each have a purpose.</li>
+          <li>LLM in three layers: interface <code>LLMInterface</code> → facade <code>LLMProvider</code> (cross-cutting) → concrete provider (factory <code>if/elif</code>); no streaming; structured output on a three-tier ladder.</li>
+          <li>A large group of providers collapses into <code>OpenAICompatibleLLM</code>; provider chosen per operation (three fallback chains); <code>LLMConfig</code> is just <code>LLMProvider</code>.</li>
+          <li>Embedding dimension owned by the model, schema follows, model switch re-dimensions; no cache.</li>
+          <li><strong>Provider/model/key are not per-bank overridable</strong> (the allowlist holds only behavioral fields) — don't be misled by CLAUDE.md. <code>none</code>/<code>mock</code> each have a purpose.</li>
         </ul>
-        <p>Last chapter: step outside the core engine and survey the whole ecosystem — how the project is packaged, deployed, and integrated into dozens of frameworks.</p>
+        <p>The last chapter steps outside the core engine to take in the whole ecosystem: the console, the CLI, the dozens of integrations, deployment shapes, and benchmarks.</p>
       </div>
 
     </article>
