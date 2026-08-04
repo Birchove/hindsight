@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(set -e)",
+      "Bash(mkdir -p hindsight-course/assets/css hindsight-course/assets/js hindsight-course/assets/img)",
+      "Bash(cp /tmp/_nettest_mermaid.js hindsight-course/assets/js/mermaid.min.js)",
+      "Bash(curl -sSL --max-time 20 -o hindsight-course/assets/js/highlight.min.js https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js)",
+      "Bash(curl -sSL --max-time 20 -o hindsight-course/assets/css/hljs-github.css https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css)",
+      "Bash(awk 'NR>=4600 && NR<=4615' engine/memory_engine.py)",
+      "Bash(awk 'NR>=803 && NR<=820' engine/memory_engine.py)",
+      "Bash(python3 -)",
+      "Bash(rm -rf /mnt/d/tmp-hs-chrome-profile2 /mnt/d/tmp-hs-shots)",
+      "Bash(/mnt/d/Nodejs/node-v24.15.0-win-x64/node.exe --check assets/js/course.js)",
+      "Bash(xargs -n1 basename)"
+    ]
+  }
+}

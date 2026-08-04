@@ -1,7 +1,8 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-cd "$(dirname "$0")/../.."
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
 
 ENV_FILE=".env"
 if [ ! -f "$ENV_FILE" ]; then
@@ -12,9 +13,10 @@ fi
 echo "Loading environment from $ENV_FILE"
 echo ""
 
-# Export all variables from env file
 set -a
+# shellcheck disable=SC1091
 source "$ENV_FILE"
 set +a
 
+# Optional: dedicated worker process. Default API embeds an in-process poller.
 uv run hindsight-worker "$@"

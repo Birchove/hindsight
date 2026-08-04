@@ -1,8 +1,19 @@
+[project]
+name = "hindsight-local"
+version = "0.0.0"
+description = "Local workspace: hindsight-api-slim only"
+requires-python = ">=3.11"
+dependencies = [
+    # embedded-db = pg0; local-ml = local embed/rerank; test = pytest suite deps
+    "hindsight-api-slim[embedded-db,local-ml,test]",
+]
+
 [tool.uv.workspace]
-members = ["hindsight-all", "hindsight-api", "hindsight-api-slim", "hindsight-all-slim", "hindsight-dev", "hindsight-mcp-server", "hindsight-clients/python", "hindsight-embed"]
+members = ["hindsight-api-slim"]
 
 [tool.uv]
-# Allow uv to search all configured indexes for packages, not just the first one
-# This prevents dependency resolution failures when using pytorch index + PyPI
+package = false
 index-strategy = "unsafe-best-match"
-dev-dependencies = []
+
+[tool.uv.sources]
+hindsight-api-slim = { workspace = true }

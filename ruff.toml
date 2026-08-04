@@ -7,26 +7,12 @@ exclude = [
 ]
 
 [lint]
-# Tests are formatted (via `ruff format`) but excluded from lint rules, which
-# are too noisy for test code (unused imports/vars, import ordering).
 exclude = [
     "tests/**",
     "**/tests/**",
 ]
-select = [
-    "E",      # pycodestyle errors
-    "W",      # pycodestyle warnings
-    "F",      # Pyflakes
-    "I",      # isort
-]
-ignore = [
-    "E501",   # line too long (handled by formatter)
-    "E402",   # module import not at top of file
-    "F401",   # unused import (too noisy during development)
-    "F841",   # unused variable (too noisy during development)
-    "F811",   # redefined while unused
-    "F821",   # undefined name (forward references in type hints)
-]
+select = ["E", "W", "F", "I"]
+ignore = ["E501", "E402", "F401", "F841", "F811", "F821"]
 
 [format]
 quote-style = "double"
