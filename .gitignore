@@ -25,3 +25,11 @@ logs/
 .mcp.json
 .worktrees/
 node_modules
+
+# Local engineering notes (not for commit)
+details/
+
+# Internal handoff archives (contain .env; do not commit)
+*.zip
+*.tar.gz
+hindsight-api-slim-local-*.zip
