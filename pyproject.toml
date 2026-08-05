@@ -1,7 +1,7 @@
 [project]
 name = "hindsight-local"
 version = "0.0.0"
-description = "Local workspace: hindsight-api-slim only"
+description = "Local workspace: hindsight-api-slim + control-plane"
 requires-python = ">=3.11"
 dependencies = [
     # embedded-db = pg0; local-ml = local embed/rerank; test = pytest suite deps

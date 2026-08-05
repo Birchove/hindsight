@@ -1,49 +1,50 @@
-# Hindsight (api-slim only)
+# Hindsight (API + Control Plane)
 
-Trimmed workspace that keeps **`hindsight-api-slim`** and the scripts needed to run it locally (no Docker).
+Trimmed workspace for local development **without Docker**:
+
+- **Backend**: `hindsight-api-slim` (memory engine + HTTP API)
+- **Frontend**: `hindsight-control-plane` (Next.js UI from upstream)
+- **TS client**: `hindsight-clients/typescript` (Control Plane dependency)
 
 ## Setup
 
 ```bash
 ./scripts/dev/setup.sh
 # edit .env (LLM / embeddings / reranker)
+```
+
+Requires **Node.js ≥ 20** and **uv** (Python). Root `.npmrc` defaults to the npmmirror registry (npmjs can hang on slow networks); override with `--registry=https://registry.npmjs.org` if needed.
+
+## Run
+
+```bash
+# API + UI together
+./scripts/dev/start.sh
+
+# Or separately (two terminals)
 ./scripts/dev/start-api.sh
+./scripts/dev/start-control-plane.sh
 ```
 
 - API: http://localhost:8888  
+- Control Plane: http://localhost:9999  
 - OpenAPI: http://localhost:8888/docs  
-- Default DB: embedded **pg0** (no external Postgres)
+- Default DB: embedded **pg0** (`~/.pg0`)
 
-## Smoke test
+## Layout
 
-```bash
-export API=http://localhost:8888 BANK=local-debug
-
-curl -sf "$API/health"
-
-curl -sS -X PUT "$API/v1/default/banks/$BANK" \
-  -H 'Content-Type: application/json' -d '{}'
-
-curl -sS -X POST "$API/v1/default/banks/$BANK/memories" \
-  -H 'Content-Type: application/json' \
-  -d '{"items":[{"content":"Alice works at Google."}]}'
-
-curl -sS -X POST "$API/v1/default/banks/$BANK/memories/recall" \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"Where does Alice work?"}'
+```text
+hindsight-api-slim/          # backend
+hindsight-control-plane/     # frontend (GUI)
+hindsight-clients/typescript # TS SDK used by the UI
+scripts/dev/                 # setup + start scripts
+.env.example
+pyproject.toml               # uv workspace → api-slim
+package.json                 # npm workspaces → client + control-plane
 ```
 
 ## Tests
 
 ```bash
 cd hindsight-api-slim && uv run pytest tests/ -q
-```
-
-## Layout
-
-```text
-hindsight-api-slim/   # memory engine + HTTP API
-scripts/dev/          # setup.sh, start-api.sh, start-worker.sh
-.env.example          # env template
-pyproject.toml        # uv workspace → api-slim only
 ```
